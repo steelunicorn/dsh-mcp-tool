@@ -1,0 +1,16 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ES2022",
+		"moduleResolution": "Bundler",
+		"lib": ["ES2023", "DOM", "DOM.Iterable"],
+		"types": [],
+		"strict": true,
+		"outDir": "lib-client",
+		"rootDir": "src/client",
+		"declaration": false,
+		"sourceMap": false,
+		"skipLibCheck": true
+	},
+	"include": ["src/client/**/*.ts"]
+}

@@ -1,0 +1,58 @@
+{
+	"name": "dsh-mcp-tool",
+	"version": "0.1.0",
+	"description": "Per-workspace MCP server governance for DeepSeek Harness: a global server registry with lazy, agent-driven activation.",
+	"type": "module",
+	"main": "lib/index.js",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./locale/*.json": "./locale/*.json"
+	},
+	"files": [
+		"lib",
+		"locale",
+		"cordis.patch.yml"
+	],
+	"dsh": {
+		"bundle": {
+			"patch": "./cordis.patch.yml"
+		},
+		"client": {
+			"platform": "web",
+			"inject": [
+				"@deepseek-ai/dsh-client-runtime",
+				"@deepseek-ai/dsh-client-locale"
+			]
+		}
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs",
+		"test": "node --test --test-isolation=none \"test/*.test.mjs\""
+	},
+	"engines": {
+		"node": ">=24.9.0"
+	},
+	"devDependencies": {
+		"@modelcontextprotocol/sdk": "^1.32.2",
+		"@types/node": "^24.9.0",
+		"typescript": "^5.9.2"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/steelunicorn/dsh-mcp-tool.git"
+	},
+	"homepage": "https://github.com/steelunicorn/dsh-mcp-tool#readme",
+	"keywords": [
+		"dsh",
+		"dsh-plugin",
+		"deepseek-harness",
+		"mcp",
+		"model-context-protocol"
+	],
+	"private": true,
+	"dependencies": {
+		"zod": "^4.6.7"
+	}
+}

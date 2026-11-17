@@ -1,0 +1,6 @@
+node_modules/
+.npm-cache/
+lib-client/
+_probe/
+_scratch/
+*.log

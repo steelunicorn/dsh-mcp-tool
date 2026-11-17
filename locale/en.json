@@ -1,0 +1,6 @@
+{
+	"meta": {
+		"title": "MCP Tool",
+		"description": "Global MCP server registry with per-folder allowlists: servers start lazily when an agent working in a folder asks for them, and stop when it releases them or goes idle."
+	}
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: mcp-tool
+      name: 'dsh-mcp-tool'
