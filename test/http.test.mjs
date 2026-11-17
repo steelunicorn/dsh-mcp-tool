@@ -10,7 +10,7 @@ import { registerRoutes, ROUTE_PREFIX } from '../lib/http.js'
 function harness(overrides = {}) {
 	const calls = {
 		putServer: [], deleteServer: [], putPreset: [], deletePreset: [], putFolder: [], deleteFolder: [],
-		setSettings: [], load: [], release: [], changed: 0,
+		setSettings: [], load: [], release: [], changed: 0, profileEnabled: [],
 	}
 	const servers = overrides.servers ?? [
 		{ name: 'alpha', description: 'demo', transport: 'stdio', loadMode: 'lazy', command: 'node', args: ['a.mjs'], env: {} },
@@ -22,6 +22,8 @@ function harness(overrides = {}) {
 		defaultPreset: () => overrides.defaultPreset ?? { name: 'default', rows: { alpha: 'on' } },
 		folders: () => overrides.folders ?? [],
 		settings: () => overrides.settings ?? { showChip: true },
+		catalog: name => overrides.catalog?.[name] ?? [],
+		catalogAt: name => overrides.catalogAt?.[name],
 		putServer: async record => { calls.putServer.push(record) },
 		deleteServer: async name => { calls.deleteServer.push(name) },
 		putPreset: async preset => { calls.putPreset.push(preset) },
@@ -45,6 +47,7 @@ function harness(overrides = {}) {
 		activeSessionId: () => overrides.activeSessionId,
 		workspaces: () => overrides.workspaces ?? [{ path: '/work', title: 'Work' }],
 		changed: () => { calls.changed += 1 },
+		syncProfile: () => { calls.syncProfile = (calls.syncProfile ?? 0) + 1 },
 		load: async (sessionId, server, cwdHint) => {
 			calls.load.push([sessionId, server, cwdHint])
 			return { name: server, tools: [{ name: `mcp__${server}__echo` }] }
@@ -54,6 +57,8 @@ function harness(overrides = {}) {
 			return { released: true, stopped: true }
 		},
 		exists: async path => path === '/work',
+		profileOwned: server => server === 'owned',
+		...(overrides.setProfileEnabled === undefined ? {} : { setProfileEnabled: overrides.setProfileEnabled }),
 	}
 	registerRoutes(backend, {
 		register(route) {
@@ -114,6 +119,67 @@ test('GET /state lists the synthesized default preset before named ones', async 
 	assert.equal(status, 200)
 	assert.deepEqual(json.presets.map(entry => entry.name), ['default', 'work'])
 	assert.deepEqual(json.presets[1].rows, { alpha: 'off' })
+})
+
+test('GET /state mirrors the DSH MCP settings before building the document', async () => {
+	const { route, calls } = harness()
+	await call(route, 'GET', `${ROUTE_PREFIX}/state`)
+	assert.equal(calls.syncProfile, 1)
+})
+
+test('GET /state reports the origin of a mirrored server', async () => {
+	const { route } = harness({
+		servers: [{
+			name: 'p1', description: '', transport: 'stdio', command: 'p1.exe', args: [], env: {},
+			origin: 'profile',
+		}],
+	})
+	const { json } = await call(route, 'GET', `${ROUTE_PREFIX}/state`)
+	const server = json.servers[0]
+	assert.equal(server.origin, 'profile')
+	// The pool has no process for it; the host reports its state separately.
+	assert.equal(server.live, false)
+})
+
+test('GET /state reports a stopped mirror as not live and a running one as live', async () => {
+	const stopped = harness({
+		servers: [{ name: 'p1', description: '', transport: 'stdio', command: 'p1.exe', origin: 'profile' }],
+		live: [{ name: 'p1', status: 'stopped', holders: [], inFlight: 0, lastUsed: 0, toolCount: 4 }],
+	})
+	const off = await call(stopped.route, 'GET', `${ROUTE_PREFIX}/state`)
+	assert.equal(off.json.servers[0].status, 'stopped')
+	assert.equal(off.json.servers[0].live, false)
+	assert.equal(off.json.servers[0].toolCount, 4)
+
+	const running = harness({
+		servers: [{ name: 'p1', description: '', transport: 'stdio', command: 'p1.exe', origin: 'profile' }],
+		live: [{ name: 'p1', status: 'ready', holders: [], inFlight: 0, lastUsed: 0, toolCount: 4 }],
+	})
+	const on = await call(running.route, 'GET', `${ROUTE_PREFIX}/state`)
+	assert.equal(on.json.servers[0].live, true)
+})
+
+test('a mirrored server cannot be edited or deleted from the plugin', async () => {
+	const { route, calls } = harness({
+		servers: [{
+			name: 'p1', description: '', transport: 'stdio', command: 'p1.exe', args: [], env: {}, origin: 'profile',
+		}],
+	})
+	const edited = await call(route, 'POST', `${ROUTE_PREFIX}/server`, { name: 'p1', transport: 'stdio', command: 'x.exe' })
+	assert.equal(edited.status, 400)
+	assert.match(edited.json.error, /DSH MCP settings/)
+
+	const removed = await call(route, 'POST', `${ROUTE_PREFIX}/server/delete`, { name: 'p1' })
+	assert.equal(removed.status, 400)
+
+	// Starting it is the backend's call: it may start a server the settings
+	// keep switched off. The route must not decide on its own.
+	const activated = await call(route, 'POST', `${ROUTE_PREFIX}/activate`, { sessionId: 's1', server: 'p1', action: 'load' })
+	assert.equal(activated.status, 200)
+	assert.deepEqual(calls.load, [['s1', 'p1', undefined]])
+
+	const released = await call(route, 'POST', `${ROUTE_PREFIX}/activate`, { sessionId: 's1', server: 'p1', action: 'release' })
+	assert.equal(released.status, 200)
 })
 
 test('routes answer 503 until the registry opened', async () => {
@@ -215,6 +281,25 @@ test('POST /settings needs a boolean and stores it', async () => {
 	assert.equal(bad.status, 400)
 	await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { showChip: false })
 	assert.deepEqual(calls.setSettings, [{ showChip: false }])
+})
+
+test('POST /settings accepts the profile lifecycle mode and rejects an unknown one', async () => {
+	const { route, calls } = harness()
+	const bad = await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { profileLifecycle: 'mine' })
+	assert.equal(bad.status, 400)
+	assert.match(bad.json.error, /profileLifecycle/)
+	await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { profileLifecycle: 'mount' })
+	assert.deepEqual(calls.setSettings, [{ showChip: true, profileLifecycle: 'mount' }])
+})
+
+test('POST /profile/enabled flips the DSH settings entry when the host allows it', async () => {
+	const { route, calls } = harness({ setProfileEnabled: async (server, enabled) => { calls.profileEnabled.push([server, enabled]) } })
+	const { status } = await call(route, 'POST', `${ROUTE_PREFIX}/profile/enabled`, { server: 'p1', enabled: false })
+	assert.equal(status, 200)
+	assert.deepEqual(calls.profileEnabled, [['p1', false]])
+
+	const missing = await call(route, 'POST', `${ROUTE_PREFIX}/profile/enabled`, { server: 'p1', enabled: 'no' })
+	assert.equal(missing.status, 400)
 })
 
 test('GET /workspaces merges the workspace registry and the assignments', async () => {

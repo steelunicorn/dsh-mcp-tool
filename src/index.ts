@@ -11,18 +11,35 @@ import { appendFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import {
 	catalogPort,
+	configuredServers,
 	managerPort,
 	serverOfTool,
+	toolPrefix,
+	toolsOf,
 	workingDirectoryOf,
 	type AgentLike,
+	type ConfigEditorLike,
 	type Disposer,
 	type HostContext,
+	type LoaderLike,
+	type ToolSchemaLike,
 } from './host.js'
 import { registerRoutes, type GuiBackend, type WorkspaceInfo } from './http.js'
 import type { Resolution } from './policy.js'
+import {
+	hybridProfile,
+	managerProfile,
+	mountProfile,
+	type MountedProfileRuntime,
+	type MountedTool,
+	type MountOpener,
+	type MountSession,
+	type ProfileRuntime,
+} from './profile.js'
+import { ActivationError } from './runtime.js'
 import { promptText, SECTION_NAME, SECTION_ORDER } from './prompt.js'
 import { McpRuntime } from './runtime.js'
-import { Store, type ServerRecord, type StorageDomainLike } from './store.js'
+import { Store, type ProfileServer, type ServerRecord, type StorageDomainLike } from './store.js'
 import { registerTools, specOf, type ToolDefinition } from './tools.js'
 
 /** The prompt service slice this plugin uses. */
@@ -50,6 +67,8 @@ interface WorkspaceRegistryLike {
 
 /** The host context plus the services this plugin adds to the mirror. */
 export interface PluginContext extends HostContext {
+	/** One host service by name, without waiting for it to appear. */
+	get?(name: string): unknown
 	storageDomain: StorageDomainLike
 	systemPrompt: PromptServiceLike
 	webServer: WebServerLike
@@ -69,8 +88,12 @@ const MAX_LIVE = 3
 /** How often the pool looks for forgotten servers. */
 const SWEEP_MS = 30 * 1000
 
+/** Whether diagnostics are on (`MCPTOOL_DEBUG=1`), which also exposes the
+ * takeover experiment route. */
+const debugEnabled = process.env.MCPTOOL_DEBUG === '1' || process.env.MCPTOOL_DEBUG === 'true'
+
 const debug = (message: string): void => {
-	if (process.env.MCPTOOL_DEBUG !== '1' && process.env.MCPTOOL_DEBUG !== 'true') return
+	if (!debugEnabled) return
 	console.error(`[dsh-mcp-tool] ${message}`)
 	const logPath = process.env.MCPTOOL_LOG
 	if (logPath !== undefined && logPath !== '') {
@@ -119,9 +142,11 @@ export function apply(ctx: PluginContext): void {
 		}
 	}
 
+	const catalog = catalogPort(ctx)
+
 	const runtime = new McpRuntime({
 		manager: managerPort(ctx.mcpManager),
-		catalog: catalogPort(ctx),
+		catalog,
 		idleMs: IDLE_MS,
 		maxLive: MAX_LIVE,
 		// Tools of an eager server are visible without loading it first.
@@ -170,13 +195,56 @@ export function apply(ctx: PluginContext): void {
 	}
 
 	/**
+	 * Mirrors the servers configured in the DSH MCP settings.
+	 *
+	 * The mirror is one-way: the plugin never writes the profile. A configured
+	 * server is started by the DSH manager, so the plugin only tracks which
+	 * folder preset may see its tools; a server dropped from the settings is
+	 * dropped here too.
+	 */
+	const syncProfile = async (): Promise<void> => {
+		const opened = store
+		if (opened === undefined) return
+		const configured = configuredServers(ctx.mcpManager)
+		if (configured === undefined) return
+		const entries: ProfileServer[] = configured.map(({ name, entry }) => {
+			const record: ProfileServer = { name, transport: entry.transport === 'stdio' ? 'stdio' : 'http' }
+			if (record.transport === 'stdio') {
+				if (entry.command !== undefined && entry.command !== '') record.command = entry.command
+				if (entry.args !== undefined) record.args = [...entry.args]
+				if (entry.env !== undefined) record.env = { ...entry.env }
+				if (entry.cwd !== undefined && entry.cwd !== '') record.cwd = entry.cwd
+			} else {
+				if (entry.url !== undefined && entry.url !== '') record.url = entry.url
+				if (entry.headers !== undefined) record.headers = { ...entry.headers }
+			}
+			if (entry.toolCallTimeoutMs !== undefined) record.toolCallTimeoutMs = entry.toolCallTimeoutMs
+			if (entry.startupTimeoutMs !== undefined) record.startupTimeoutMs = entry.startupTimeoutMs
+			// The settings own the process: a switched-off entry has none, and
+			// only such a server may be started by the plugin on demand.
+			record.enabled = entry.enabled !== false
+			return record
+		})
+		try {
+			const result = await opened.importProfile(entries)
+			runtime.setAdopted(opened.servers().filter(record => record.origin === 'profile').map(record => record.name))
+			if (result.added.length > 0 || result.removed.length > 0) {
+				debug(`profile sync: added [${result.added.join(',')}] removed [${result.removed.join(',')}]`)
+			}
+		} catch (error) {
+			debug(`profile sync failed: ${error instanceof Error ? error.message : String(error)}`)
+		}
+		await syncEager()
+	}
+
+	/**
 	 * Keeps eager servers running wherever they are switched on, and unpins a
 	 * server whose load mode was switched back to lazy.
 	 */
 	const syncEager = async (): Promise<void> => {
 		const opened = store
 		if (opened === undefined) return
-		const records = opened.servers().filter(record => record.loadMode === 'eager')
+		const records = opened.servers().filter(record => record.loadMode === 'eager' && record.origin !== 'profile')
 		for (const record of opened.servers()) {
 			if (record.loadMode !== 'eager' && runtime.isEager(record.name)) {
 				debug(`unpinning ${record.name}`)
@@ -214,6 +282,32 @@ export function apply(ctx: PluginContext): void {
 		void syncEager()
 	}
 
+	/**
+	 * Refreshes the cached tool list of every server.
+	 *
+	 * A scan needs a live registration, so this only records what is already
+	 * known: servers this plugin runs and servers the DSH manager runs. The
+	 * cache is what lets a stopped server still be described, and what makes
+	 * discovery survive a release or a host restart.
+	 */
+	const syncCatalog = async (): Promise<void> => {
+		const opened = store
+		if (opened === undefined) return
+		for (const record of opened.servers()) {
+			// A profile server's tools are published by the official client in the
+			// global catalog, so they are read there; our pool owns the rest.
+			const tools = record.origin === 'profile'
+				? toolsOf(ctx.tools, record.name)
+				: runtime.catalogTools(record.name)
+			if (tools.length === 0) continue
+			try {
+				if (await opened.putCatalog(record.name, tools)) debug(`catalog of ${record.name}: ${tools.length} tool(s)`)
+			} catch (error) {
+				debug(`catalog of ${record.name} failed: ${error instanceof Error ? error.message : String(error)}`)
+			}
+		}
+	}
+
 	const disposers: Disposer[] = []
 
 	ctx.effect?.(() => {
@@ -246,6 +340,7 @@ export function apply(ctx: PluginContext): void {
 		const server = serverOfTool(exec.name)
 		if (server === undefined) return next()
 		runtime.beginCall(server)
+		if (profileRuntime?.started(server) === true) profileTouched.set(server, Date.now())
 		try {
 			return await next()
 		} finally {
@@ -253,17 +348,293 @@ export function apply(ctx: PluginContext): void {
 		}
 	})
 
+	// A second line of defence: a tool that is already in the model's tool list
+	// but whose server was switched off in this folder must still be refused.
+	// `restrict({ deny })` only shapes the list, it does not stop a call.
+	ctx.effect(() => {
+		if (typeof ctx.tools.guard !== 'function') {
+			debug('tools.guard is not available on this host')
+			return
+		}
+		return ctx.tools.guard((execution) => {
+			const server = serverOfTool(execution.name)
+			if (server === undefined) return undefined
+			const opened = store
+			const agentId = execution.agent?.id
+			if (opened === undefined || agentId === undefined) return undefined
+			const record = opened.server(server)
+			// Unknown servers belong to other plugins: leave them alone.
+			if (record === undefined) return undefined
+			const allowed = opened.resolve(cwdOf(agentId)).servers
+			if (allowed.includes(server)) return undefined
+			return `server "${server}" is not enabled in this folder; switch it on in Settings > MCP Tool before calling its tools`
+		})
+	}, 'mcp-tool: execution guard')
+
 	const timer = setInterval(() => {
 		const stopped = runtime.sweep()
 		if (stopped.length > 0) debug(`idle sweep stopped: ${stopped.join(', ')}`)
+		stopIdleProfiles()
 	}, SWEEP_MS)
 	// The timer must not keep the process alive on its own.
 	;(timer as unknown as { unref?: () => void }).unref?.()
 
+	/** The config editor, read through `ctx.get()` for the same reason as the
+	 * workspace registry: direct access to an undeclared service throws. */
+	const configEditor = (): ConfigEditorLike | undefined => {
+		try {
+			const host = ctx as unknown as { get?: (name: string) => unknown }
+			return (typeof host.get === 'function' ? host.get('configEditor') : undefined) as ConfigEditorLike | undefined
+		} catch (error) {
+			debug(`config editor is not available: ${String(error)}`)
+			return undefined
+		}
+	}
+
+	/**
+	 * Flips `enabled` on one server of the DSH MCP settings.
+	 *
+	 * This is the sanctioned path for the takeover experiment: the write goes
+	 * through the host's config editor (schema validation, the right layer,
+	 * a formatted patch) instead of editing `cordis.patch.yml` by hand, and
+	 * `servers` is a volatile field of the manager, so the manager applies the
+	 * change without restarting its own fiber.
+	 */
+	const setProfileEnabled = async (server: string, enabled: boolean): Promise<void> => {
+		const editor = configEditor()
+		if (editor === undefined) throw new Error('the config editor is not available in this host')
+		const entry = editor.entries().find(row => row.options.id === 'mcp-manager' || row.options.name === '@deepseek-ai/dsh-mcp-manager')
+		if (entry === undefined) throw new Error('the DSH MCP manager is not part of this profile')
+		await editor.edit(entry, (raw) => {
+			const servers = raw['servers']
+			const table = typeof servers === 'object' && servers !== null && !Array.isArray(servers)
+				? servers as Record<string, Record<string, unknown>>
+				: {}
+			const current = table[server]
+			if (current === undefined) throw new Error(`server "${server}" is not configured in the DSH MCP settings`)
+			return { ...raw, servers: { ...table, [server]: { ...current, enabled } } }
+		})
+		debug(`profile server ${server}: enabled=${String(enabled)}`)
+	}
+
+	/**
+	 * Lifetime owner of the mirrored servers, created on first use because it
+	 * needs the opened store. `flip` lets the DSH manager own the process,
+	 * `mount` starts a private client instance, `auto` picks per server.
+	 */
+	let profileRuntime: MountedProfileRuntime | undefined
+	/** Last time a tool of a profile server the plugin started was called. */
+	const profileTouched = new Map<string, number>()
+	/** Tools projected from a private mount into each live agent's tool list. */
+	const projections = new Map<string, Map<string, Disposer>>()
+
+	/** The loader service, when the host offers one. */
+	const loaderOf = (): LoaderLike | undefined => {
+		try {
+			const loader = ctx.get?.('loader')
+			if (loader === undefined || loader === null) return undefined
+			return loader as LoaderLike
+		} catch {
+			return undefined
+		}
+	}
+
+	/** The module shape `@deepseek-ai/dsh-scope` exposes to a plugin. */
+	interface ScopeModule {
+		createScope(context: unknown, key: unknown): {
+			ctx: { plugin(module: unknown, config?: unknown): unknown }
+			dispose(): Promise<void>
+		}
+	}
+
+	/** The module shape `@deepseek-ai/dsh-mcp-client` exposes to a plugin. */
+	interface McpClientModule {
+		apply: unknown
+		inject: unknown
+		name: string
+		Config?: unknown
+	}
+
+	const mountOpener: MountOpener = {
+		async open(server: string): Promise<MountSession> {
+			const opened = store
+			const record = opened?.server(server)
+			if (record === undefined) throw new ActivationError(`unknown MCP server "${server}"`, server, 'unknown')
+			const loader = loaderOf()
+			if (loader === undefined) {
+				throw new ActivationError('the loader service is not available in this host', server, 'failed')
+			}
+			const scopeModule = (await loader.import('@deepseek-ai/dsh-scope')) as ScopeModule
+			const client = (await loader.import('@deepseek-ai/dsh-mcp-client')) as McpClientModule
+			const scopeKey: Record<string, unknown> = { dshMcpToolMount: true, server }
+			const scoped = scopeModule.createScope(ctx, scopeKey)
+			const config: Record<string, unknown> = {
+				serverName: server,
+				transport: record.transport === 'http' ? 'streamable-http' : 'stdio',
+			}
+			if (record.transport === 'http') {
+				config.url = record.url ?? ''
+				config.headers = record.headers ?? {}
+			} else {
+				config.command = record.command ?? ''
+				config.args = record.args ?? []
+				config.env = record.env ?? {}
+				if (record.cwd !== undefined) config.cwd = record.cwd
+			}
+			if (record.toolCallTimeoutMs !== undefined) config.toolCallTimeoutMs = record.toolCallTimeoutMs
+			scoped.ctx.plugin(
+				{ apply: client.apply, inject: client.inject, name: client.name, Config: client.Config },
+				config,
+			)
+			debug(`mounted private client for ${server}`)
+			const tools = (): MountedTool[] => {
+				try {
+					const schemas: readonly ToolSchemaLike[] = ctx.tools.schemas?.(scopeKey) ?? []
+					return schemas
+						.filter(schema => schema.name.startsWith(toolPrefix(server)))
+						.map(schema => ({
+							name: schema.name,
+							...(schema.description === undefined ? {} : { description: schema.description }),
+							...(schema.parameters === undefined ? {} : { parameters: schema.parameters }),
+							...(ctx.tools.get?.(schema.name, scopeKey) === undefined
+								? {}
+								: { definition: ctx.tools.get?.(schema.name, scopeKey) }),
+						}))
+				} catch (error) {
+					debug(`scoped tool list of ${server} failed: ${error instanceof Error ? error.message : String(error)}`)
+					return []
+				}
+			}
+			return {
+				tools,
+				async dispose(): Promise<void> {
+					await scoped.dispose()
+					debug(`disposed private client for ${server}`)
+				},
+			}
+		},
+	}
+
+	const profileOf = (): MountedProfileRuntime | undefined => {
+		if (profileRuntime !== undefined) return profileRuntime
+		const opened = store
+		if (opened === undefined) return undefined
+		const control = {
+			setEnabled: setProfileEnabled,
+			current: (server: string) => opened.server(server)?.profileEnabled,
+		}
+		const flip = managerProfile(control, managerPort(ctx.mcpManager), catalog)
+		const mount = mountProfile(mountOpener, control)
+		const lifecycle = opened.settings().profileLifecycle
+		const empty: MountedProfileRuntime = { ...flip, tools: () => [] }
+		if (lifecycle === 'flip') {
+			profileRuntime = empty
+		} else if (lifecycle === 'mount') {
+			profileRuntime = mount
+		} else {
+			// An entry the settings keep enabled already took the name in the
+			// root scope, so it can only be used through a private mount.
+			profileRuntime = hybridProfile(flip, mount, server => opened.server(server)?.profileEnabled !== false)
+		}
+		return profileRuntime
+	}
+
+	/**
+	 * Projects the tools of privately mounted servers into the live agents.
+	 *
+	 * A mounted client publishes its tools inside its own scope; agents do not
+	 * inherit that scope, so the tools are registered into each agent's tool
+	 * list, and only for folders whose preset allows the server.
+	 */
+	const projectMounted = (): void => {
+		const profile = profileRuntime
+		const opened = store
+		if (profile === undefined || opened === undefined) return
+		let agents: AgentLike[] = []
+		try {
+			agents = ctx.agents.list()
+		} catch {
+			return
+		}
+		const live = new Set(agents.map(agent => agent.id))
+		for (const id of [...projections.keys()]) {
+			if (!live.has(id)) projections.delete(id)
+		}
+		for (const agent of agents) {
+			const allowed = new Set(opened.resolve(workingDirectoryOf(ctx, agent)).servers)
+			const want = new Map<string, unknown>()
+			for (const record of opened.servers()) {
+				if (record.origin !== 'profile' || !allowed.has(record.name)) continue
+				if (!profile.started(record.name)) continue
+				for (const tool of profile.tools(record.name)) {
+					if (tool.definition !== undefined) want.set(tool.name, tool.definition)
+				}
+			}
+			const have = projections.get(agent.id) ?? new Map<string, Disposer>()
+			for (const [name, dispose] of [...have]) {
+				if (want.has(name)) continue
+				dispose()
+				have.delete(name)
+			}
+			for (const [name, definition] of want) {
+				if (have.has(name)) continue
+				try {
+					have.set(name, agent.ctx.tools.register(definition as never))
+				} catch (error) {
+					debug(`projection of ${name} into ${agent.id} failed: ${error instanceof Error ? error.message : String(error)}`)
+				}
+			}
+			projections.set(agent.id, have)
+		}
+	}
+
+	/** Stops the mirrored servers this plugin started and nobody touched for a while. */
+	const stopIdleProfiles = (): void => {
+		const profile = profileRuntime
+		const opened = store
+		if (profile === undefined || opened === undefined) return
+		const now = Date.now()
+		for (const record of opened.servers()) {
+			if (record.origin !== 'profile' || !profile.started(record.name)) continue
+			const seen = profileTouched.get(record.name)
+			if (seen === undefined) {
+				// First sweep after the start: begin the idle window from now.
+				profileTouched.set(record.name, now)
+				continue
+			}
+			if (now - seen < IDLE_MS) continue
+			profileTouched.delete(record.name)
+			debug(`idle stop of profile server ${record.name}`)
+			void profile.stop(record.name)
+		}
+	}
+
 	const backend: GuiBackend = {
 		store: () => store,
 		storeError: () => storeError,
-		live: () => runtime.snapshot(),
+		live: () => {
+			const rows = runtime.snapshot()
+			const opened = store
+			if (opened === undefined) return rows
+			const seen = new Set(rows.map(row => row.name))
+			const manager = managerPort(ctx.mcpManager)
+			for (const record of opened.servers()) {
+				if (record.origin !== 'profile' || seen.has(record.name)) continue
+				// An entry the plugin mounted itself is owned by our runtime; the
+				// rest are started and stopped by the DSH manager.
+				const mounted = (profileRuntime?.tools(record.name).length ?? 0) > 0
+				rows.push({
+					name: record.name,
+					status: mounted ? 'ready' : manager.status(record.name),
+					holders: [],
+					inFlight: 0,
+					lastUsed: 0,
+					toolCount: runtime.catalogTools(record.name).length,
+					...(manager.detail?.(record.name) === undefined ? {} : { error: manager.detail?.(record.name) as string }),
+				})
+			}
+			return rows
+		},
 		policyForSession: (_sessionId: string | undefined, cwd: string) => policyFor('', cwd),
 		cwdOfSession: (sessionId: string | undefined) => {
 			if (sessionId === undefined || sessionId === '') return undefined
@@ -291,8 +662,23 @@ export function apply(ctx: PluginContext): void {
 		},
 		workspaces,
 		changed: () => {
-			void syncEager()
+			// A new mode owns the servers differently, so the old runtime lets go.
+			const previous = profileRuntime
+			profileRuntime = undefined
+			void previous?.dispose()
+			void syncProfile().then(() => {
+				syncCatalog()
+				projectMounted()
+			})
 		},
+		syncProfile: async () => {
+			await syncProfile()
+			await syncCatalog()
+			projectMounted()
+		},
+		syncCatalog: () => syncCatalog(),
+		setProfileEnabled,
+		profileOwned: (server: string) => profileRuntime?.started(server) === true,
 		async load(sessionId: string, server: string, cwdHint?: string) {
 			const agent = agentOf(sessionId)
 			const cwd = agent === undefined ? cwdHint ?? '' : workingDirectoryOf(ctx, agent)
@@ -304,9 +690,34 @@ export function apply(ctx: PluginContext): void {
 			debug(`load ${server} for ${holder} cwd=${cwd} allowed=[${allowed.join(',')}]`)
 			const record = store?.server(server)
 			if (record === undefined) throw new Error(`unknown MCP server "${server}"`)
+			if (record.origin === 'profile') {
+				const live = runtime.catalogTools(server)
+				if (live.length > 0) return { name: server, tools: live }
+				const profile = profileOf()
+				// A private mount can use a server the settings keep enabled too:
+				// the mount does not touch that entry. Only the manager-backed
+				// runtime needs the entry switched off to take the name.
+				const mounted = profile !== undefined && profile.tools(server).length > 0
+				if (profile === undefined || (record.profileEnabled !== false && !mounted)) {
+					throw new Error(`server "${server}" is configured in the DSH MCP settings; edit it there`)
+				}
+				await profile.start(server, record.startupTimeoutMs ?? 30_000)
+				profileTouched.set(server, Date.now())
+				projectMounted()
+				const tools = profile.tools(server)
+				return { name: server, tools: tools.length > 0 ? tools : runtime.catalogTools(server) }
+			}
 			return runtime.load(specOf(record), holder, allowed)
 		},
 		release(sessionId: string, server: string) {
+			const record = store?.server(server)
+			if (record?.origin === 'profile') {
+				const profile = profileOf()
+				if (profile?.started(server) !== true) return { released: false, stopped: false }
+				profileTouched.delete(server)
+				void profile.stop(server).then(() => projectMounted(), () => projectMounted())
+				return { released: true, stopped: true }
+			}
 			const released = runtime.holders(server).includes(sessionId)
 			const { stopped } = runtime.release(server, sessionId)
 			return { released, stopped }
@@ -340,6 +751,7 @@ export function apply(ctx: PluginContext): void {
 				toolsDispose = registerTools({
 					store: opened,
 					runtime,
+					profile: profileOf(),
 					policyFor,
 					cwdOf,
 					register: (definition: ToolDefinition) => ctx.tools.register(
@@ -361,7 +773,7 @@ export function apply(ctx: PluginContext): void {
 						return promptText(cwd, resolution, servers)
 					},
 				})
-				await syncEager()
+				await syncProfile()
 			} catch (error) {
 				storeError = error instanceof Error ? error.message : String(error)
 				debug(`registry failed to open: ${storeError}`)
@@ -378,7 +790,14 @@ export function apply(ctx: PluginContext): void {
 			store = undefined
 			void opened?.close()
 			clearInterval(timer)
+			for (const tools of projections.values()) {
+				for (const dispose of tools.values()) dispose()
+			}
+			projections.clear()
+			void profileRuntime?.dispose()
+			profileRuntime = undefined
 			runtime.dispose()
 		}
 	}, 'mcp-tool: runtime')
 }
+

@@ -22,21 +22,25 @@ export function promptText(cwd: string, resolution: Resolution, servers: ServerR
 	if (servers.length === 0) return ''
 	const list = servers
 		.map(record => {
-			const mode = record.loadMode === 'eager' ? ', always running' : ''
+			const external = record.origin === 'profile'
+			const mode = external || record.loadMode === 'eager' ? ', always running' : ''
 			return `- ${record.name} (${record.transport}${mode})${record.description === undefined ? '' : `: ${record.description}`}`
 		})
 		.join('\n')
 	const origin = resolution.source === 'folder'
 		? `from the preset "${resolution.preset}" assigned to ${resolution.path ?? cwd}`
 		: `from the default preset "${resolution.preset}"`
-	return [
+	const lines = [
 		`MCP servers available in ${cwd} (${origin}):`,
 		list,
 		'',
-		'These servers are registered globally but stay stopped until you need them.',
+		'Servers marked "always running" are started by the DSH MCP settings: their tools',
+		'are already available, and mcp_load only lists them.',
+		'The other servers are registered globally but stay stopped until you need them.',
 		'Call mcp_load with a server name to start it; its tools become callable as',
 		'mcp__<server>__<tool> starting with your next step. Call mcp_release as soon as',
 		'you are done with a server, so its process stops. A folder without its own',
 		'preset uses the default preset, which may switch every server off.',
-	].join('\n')
+	]
+	return lines.join('\n')
 }

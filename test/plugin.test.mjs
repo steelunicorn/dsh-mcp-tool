@@ -24,11 +24,22 @@ function fakeHost(options = {}) {
 	const listeners = new Map()
 	const store = { value: { showChip: true } }
 	const tables = new Map([['servers', new Map()], ['presets', new Map()], ['workspaces', new Map()]])
+	const configured = options.configured ?? {}
+	const registered = []
+	const activeRestrictions = []
+	const guards = []
 
 	const ctx = {
 		mcpManager: {
-			list: () => [...servers].map(([serverName, entry]) => ({ name: serverName, configured: false, status: entry.status })),
+			config: { servers: { get: () => configured } },
+			list: () => [
+				...[...servers].map(([serverName, entry]) => ({ name: serverName, configured: true, status: entry.status })),
+				...Object.keys(configured)
+					.filter(serverName => !servers.has(serverName))
+					.map(serverName => ({ name: serverName, configured: true, status: { state: 'disabled' } })),
+			],
 			register(serverName) {
+				registered.push(serverName)
 				servers.set(serverName, { status: { state: 'connected', toolCount: 1 } })
 				defs.set(`mcp__${serverName}__echo`, { name: `mcp__${serverName}__echo`, description: 'echo', parameters: {} })
 				return () => {
@@ -43,7 +54,20 @@ function fakeHost(options = {}) {
 				tools.set(definition.name, { definition, when: registerOptions?.when })
 				return () => tools.delete(definition.name)
 			},
-			restrict: () => () => {},
+			restrict(filter) {
+				activeRestrictions.push(filter)
+				return () => {
+					const index = activeRestrictions.indexOf(filter)
+					if (index >= 0) activeRestrictions.splice(index, 1)
+				}
+			},
+			guard(fn) {
+				guards.push(fn)
+				return () => {
+					const index = guards.indexOf(fn)
+					if (index >= 0) guards.splice(index, 1)
+				}
+			},
 		},
 		agents: { list: () => agents, get: id => agents.find(agent => agent.id === id) },
 		workingDirectory: { get: session => session.header.cwd },
@@ -79,7 +103,35 @@ function fakeHost(options = {}) {
 	}
 	// The pool installs a per-agent deny list through the scoped tools service.
 	for (const agent of agents) agent.ctx.tools = ctx.tools
-	return { ctx, agents, servers, defs, tools, sections, routes, disposers, cwd, tables }
+	// Servers configured in the DSH MCP settings are already mounted and their
+	// tools are already in the catalog; the plugin only mirrors the record.
+	// A server the settings keep switched off has no process and no tools.
+	const mount = serverName => {
+		servers.set(serverName, { status: { state: 'connected', toolCount: 1 } })
+		defs.set(`mcp__${serverName}__echo`, { name: `mcp__${serverName}__echo`, description: 'echo', parameters: {} })
+	}
+	const unmount = serverName => {
+		servers.delete(serverName)
+		for (const key of [...defs.keys()]) if (key.startsWith(`mcp__${serverName}__`)) defs.delete(key)
+	}
+	for (const [serverName, entry] of Object.entries(configured)) {
+		if (entry.enabled !== false) mount(serverName)
+	}
+	// The manager entry the plugin flips through the config editor. Enabling a
+	// server mounts it, exactly as the real manager's reconcile does.
+	ctx.configEditor = {
+		entries: () => [{ options: { id: 'mcp-manager', name: '@deepseek-ai/dsh-mcp-manager' } }],
+		edit: async (_entry, change) => {
+			const patch = change({ servers: configured })
+			for (const [serverName, entry] of Object.entries(patch.servers)) {
+				configured[serverName] = entry
+				if (entry.enabled === false) unmount(serverName)
+				else mount(serverName)
+			}
+		},
+	}
+	ctx.get = name => (name === 'configEditor' ? ctx.configEditor : ctx.workspaceRegistry)
+	return { ctx, agents, servers, defs, tools, sections, routes, disposers, cwd, tables, registered, activeRestrictions, guards, configured }
 }
 
 async function call(route, method, path, body) {
@@ -338,5 +390,157 @@ test('the chip switch is stored and reported back', async () => {
 	const off = await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { showChip: false })
 	assert.equal(off.status, 200)
 	const state = await call(route, 'GET', `${ROUTE_PREFIX}/state?sessionId=a1`)
-	assert.deepEqual(state.json.settings, { showChip: false })
+	assert.deepEqual(state.json.settings, { showChip: false, profileLifecycle: 'auto' })
+})
+
+test('servers configured in the DSH MCP settings are mirrored and switched off', async () => {
+	const host = fakeHost({ configured: { p1: { transport: 'stdio', command: 'C:/tools/p1.exe', args: ['--mcp'] } } })
+	apply(host.ctx)
+	await tick()
+
+	const route = host.routes[0]
+	const state = await call(route, 'GET', `${ROUTE_PREFIX}/state?sessionId=a1`)
+	const record = state.json.servers.find(server => server.name === 'p1')
+	assert.equal(record.origin, 'profile')
+	// The host reports the live state of the process it started.
+	assert.equal(record.status, 'ready')
+	assert.equal(record.loadMode, 'lazy')
+	assert.equal(record.command, 'C:/tools/p1.exe')
+	// The plugin mirrored the record; it did not start a second process.
+	assert.deepEqual(host.registered, [])
+	// A new import is switched off in the default preset.
+	assert.equal(state.json.presets[0].name, 'default')
+	assert.equal(state.json.presets[0].rows.p1, 'off')
+	// ... and its tools are withheld from the agent until a preset allows it.
+	assert.equal(state.json.servers.find(server => server.name === 'p1').allowed, false)
+	assert.ok(host.activeRestrictions.some(filter => filter.deny.includes('mcp__p1__echo')))
+})
+
+test('a preset that allows a profile server reveals its tools without a process start', async () => {
+	const host = fakeHost({ configured: { p1: { transport: 'stdio', command: 'C:/tools/p1.exe' } } })
+	apply(host.ctx)
+	await tick()
+	const route = host.routes[0]
+	await call(route, 'POST', `${ROUTE_PREFIX}/preset`, { name: 'work', rows: { p1: 'on' } })
+	await call(route, 'POST', `${ROUTE_PREFIX}/folder`, { path: 'D:/work', preset: 'work' })
+	await waitUntil(() => !host.activeRestrictions.some(filter => filter.deny.includes('mcp__p1__echo')))
+	assert.deepEqual(host.registered, [])
+
+	const loaded = await host.tools.get('mcp_load').definition.execute({ server: 'p1' }, { agent: { id: 'a1' } })
+	assert.equal(loaded.status, 'external')
+	assert.deepEqual(loaded.tools.map(tool => tool.name), ['mcp__p1__echo'])
+	assert.deepEqual(host.registered, [])
+})
+
+test('a profile server cannot be edited or deleted through the GUI', async () => {
+	const host = fakeHost({ configured: { p1: { transport: 'stdio', command: 'C:/tools/p1.exe' } } })
+	apply(host.ctx)
+	await tick()
+	const route = host.routes[0]
+
+	const edited = await call(route, 'POST', `${ROUTE_PREFIX}/server`, { name: 'p1', transport: 'stdio', command: 'other.exe' })
+	assert.equal(edited.status, 400)
+	assert.match(edited.json.error, /DSH MCP settings/)
+
+	const removed = await call(route, 'POST', `${ROUTE_PREFIX}/server/delete`, { name: 'p1' })
+	assert.equal(removed.status, 400)
+
+	// Its process belongs to the settings; loading only reveals live tools.
+	const activated = await call(route, 'POST', `${ROUTE_PREFIX}/activate`, { sessionId: 'a1', server: 'p1', action: 'load' })
+	assert.equal(activated.status, 200)
+	assert.deepEqual(activated.json.tools, ['mcp__p1__echo'])
+	assert.deepEqual(host.registered, [])
+})
+
+test('a profile server switched off in the settings is started on demand and stopped on release', async () => {
+	const host = fakeHost({
+		configured: { p1: { transport: 'stdio', command: 'C:/tools/p1.exe', enabled: false } },
+	})
+	apply(host.ctx)
+	await tick()
+	const route = host.routes[0]
+
+	const before = await call(route, 'GET', `${ROUTE_PREFIX}/state?sessionId=a1`)
+	assert.equal(before.json.servers.find(server => server.name === 'p1').status, 'stopped')
+
+	const loaded = await call(route, 'POST', `${ROUTE_PREFIX}/activate`, { sessionId: 'a1', server: 'p1', action: 'load' })
+	assert.equal(loaded.status, 200)
+	assert.equal(host.configured.p1.enabled, true)
+	assert.deepEqual(loaded.json.tools, ['mcp__p1__echo'])
+	const after = await call(route, 'GET', `${ROUTE_PREFIX}/state?sessionId=a1`)
+	assert.equal(after.json.servers.find(server => server.name === 'p1').status, 'ready')
+
+	const released = await call(route, 'POST', `${ROUTE_PREFIX}/activate`, { sessionId: 'a1', server: 'p1', action: 'release' })
+	assert.equal(released.status, 200)
+	await waitUntil(() => host.configured.p1.enabled === false)
+	assert.deepEqual(host.registered, [])
+})
+
+test('a server dropped from the DSH MCP settings disappears from the registry', async () => {
+	const configured = { p1: { transport: 'stdio', command: 'C:/tools/p1.exe' }, p2: { transport: 'stdio', command: 'C:/tools/p2.exe' } }
+	const host = fakeHost({ configured })
+	apply(host.ctx)
+	await tick()
+	const route = host.routes[0]
+	let state = await call(route, 'GET', `${ROUTE_PREFIX}/state?sessionId=a1`)
+	assert.equal(state.json.servers.length, 2)
+
+	delete configured.p2
+	state = await call(route, 'GET', `${ROUTE_PREFIX}/state?sessionId=a1`)
+	assert.deepEqual(state.json.servers.map(server => server.name), ['p1'])
+	assert.equal(state.json.presets[0].rows.p2, undefined)
+})
+
+test('the execution guard refuses a server the folder preset switched off', async () => {
+	const host = fakeHost({ agents: [
+		{ id: 'a1', ctx: {}, session: { header: { cwd: 'D:/work' } } },
+	] })
+	apply(host.ctx)
+	await tick()
+	const route = host.routes[0]
+	await call(route, 'POST', `${ROUTE_PREFIX}/server`, { name: 'alpha', transport: 'stdio', command: 'node' })
+	await call(route, 'POST', `${ROUTE_PREFIX}/server`, { name: 'beta', transport: 'stdio', command: 'node' })
+	await call(route, 'POST', `${ROUTE_PREFIX}/preset`, { name: 'quiet', rows: { beta: 'off' } })
+	await call(route, 'POST', `${ROUTE_PREFIX}/folder`, { path: 'D:/work', preset: 'quiet' })
+	await waitUntil(() => host.guards.length === 1)
+
+	const guard = host.guards[0]
+	assert.equal(guard({ name: 'mcp__alpha__echo', agent: { id: 'a1' } }), undefined)
+	assert.match(guard({ name: 'mcp__beta__echo', agent: { id: 'a1' } }), /not enabled in this folder/)
+	// Tools of other plugins and non-MCP tools are none of our business.
+	assert.equal(guard({ name: 'read_file', agent: { id: 'a1' } }), undefined)
+	assert.equal(guard({ name: 'mcp__ghost__echo', agent: { id: 'a1' } }), undefined)
+})
+
+test('a successful load caches the tool list of the server', async () => {
+	const host = fakeHost()
+	apply(host.ctx)
+	await tick()
+	await call(host.routes[0], 'POST', `${ROUTE_PREFIX}/server`, { name: 'alpha', transport: 'stdio', command: 'node' })
+	const agent = host.agents[0]
+	await host.tools.get('mcp_load').definition.execute({ server: 'alpha' }, { agent })
+	const cached = host.tables.get('servers').get('alpha').catalog
+	assert.deepEqual(cached.tools.map(tool => tool.name), ['mcp__alpha__echo'])
+	assert.equal(typeof cached.updatedAt, 'number')
+	// The page shows the cached size even when the process is not running.
+	const state = await call(host.routes[0], 'GET', `${ROUTE_PREFIX}/state`)
+	const row = state.json.servers.find(server => server.name === 'alpha')
+	assert.equal(row.toolCount, 1)
+	await host.tools.get('mcp_release').definition.execute({ server: 'alpha' }, { agent })
+	const after = await call(host.routes[0], 'GET', `${ROUTE_PREFIX}/state`)
+	assert.equal(after.json.servers.find(server => server.name === 'alpha').toolCount, 1)
+})
+test('mount mode reports a missing loader instead of pretending to start', async () => {
+	const host = fakeHost({
+		configured: { p1: { transport: 'stdio', command: 'C:/tools/p1.exe', enabled: false } },
+	})
+	apply(host.ctx)
+	await tick()
+	const route = host.routes[0]
+	await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { profileLifecycle: 'mount' })
+	const loaded = await call(route, 'POST', `${ROUTE_PREFIX}/activate`, { sessionId: 'a1', server: 'p1', action: 'load' })
+	assert.equal(loaded.status, 400)
+	assert.match(loaded.json.error, /loader service/)
+	// The entry was not touched: nothing may be flipped on for a failed mount.
+	assert.equal(host.configured.p1.enabled, false)
 })

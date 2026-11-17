@@ -31,6 +31,17 @@ const NS = 'mcp-tool'
 const ROUTE = '/dsh-mcp-tool'
 const SECTION_ID = 'mcp-tool'
 const DEFAULT_PRESET = 'default'
+// Inline styles cannot express `:hover`, but the shell's own buttons paint the
+// `interactive-bg-hover` fill on hover. One small stylesheet scoped to our own
+// containers restores that feedback (and the focus ring) for free.
+const CSS = [
+	'[data-mcptool] button { -webkit-font-smoothing: antialiased; text-autospace: normal; }',
+	'[data-mcptool] button:not([data-chip]):not([data-fill]):hover { background: var(--dsw-alias-interactive-bg-hover, #ffffff14); }',
+	'[data-mcptool] button:not([data-chip]):not([data-fill]):active { background: var(--dsw-alias-interactive-bg-active, #ffffff24); }',
+	'[data-mcptool] button[data-fill]:hover { filter: brightness(1.14); }',
+	'[data-mcptool] button[data-fill]:active { filter: brightness(1.28); }',
+	'[data-mcptool] button:focus-visible { outline: 2px solid var(--dsw-alias-border-selected, #adb2b8); outline-offset: 1px; }',
+].join('\n')
 
 /** Namespaces and slot ids announced to the shell. */
 export const inject = ['slots', 'locale']
@@ -46,6 +57,8 @@ interface ServerView {
 	description: string
 	transport: 'stdio' | 'http'
 	loadMode: 'lazy' | 'eager'
+	/** `profile` servers come from the DSH MCP settings and are read-only here. */
+	origin?: 'manual' | 'profile'
 	command: string
 	args: string[]
 	env: Record<string, string>
@@ -58,6 +71,12 @@ interface ServerView {
 	live: boolean
 	holders: string[]
 	toolCount: number
+	/** When the cached tool list was last refreshed; 0 means never. */
+	catalogAt?: number
+	/** Whether the DSH MCP settings keep the mirrored server switched on. */
+	profileEnabled?: boolean
+	/** Whether this plugin is the one that started it on demand. */
+	owned?: boolean
 	allowed: boolean
 }
 
@@ -77,6 +96,9 @@ interface WorkspaceView {
 	title?: string
 }
 
+/** Who owns the process of a server that comes from the DSH MCP settings. */
+export type Lifecycle = 'auto' | 'flip' | 'mount'
+
 interface StateDoc {
 	ok: true
 	/** Session the document was resolved for (the host picks the active one when the GUI has no session id). */
@@ -85,7 +107,7 @@ interface StateDoc {
 	source: 'folder' | 'default'
 	preset: string
 	folderPath: string | null
-	settings: { showChip: boolean }
+	settings: { showChip: boolean; profileLifecycle: Lifecycle }
 	servers: ServerView[]
 	presets: PresetView[]
 	folders: FolderView[]
@@ -260,6 +282,36 @@ const ACCENT = 'var(--dsw-alias-brand-primary, #1f1f1f)'
 const ON_ACCENT = 'var(--dsw-alias-label-primary-inverted, #ffffff)'
 const HOVER = 'var(--dsw-alias-button-ghost-active-fill, rgba(0, 0, 0, 0.06))'
 
+// Shared metrics for every button-like control: one height keeps rows of
+// different widgets aligned, one font size keeps the labels comparable.
+// Mirrors the app's own small outline button (`_button _outline _sm`): height
+// 28, 12/18 type, 10px padding, hairline inset outline, transparent fill. Using
+// the same numbers keeps plugin controls identical to the surrounding UI.
+const CONTROL: any = {
+	display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '4px',
+	boxSizing: 'border-box', height: '28px', padding: '0 10px',
+	borderRadius: 'var(--dsw-radius-sm, 8px)', fontSize: '12px', lineHeight: '18px',
+	fontFamily: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap',
+	color: TEXT, background: 'transparent',
+	border: '0.5px solid transparent',
+	// Squircle corners: the shell sets `corner-shape: superellipse(1.5)` on its
+	// own buttons, which is what makes them look softer than a plain radius.
+	cornerShape: 'var(--dsw-corner-shape, superellipse(1.5))',
+	boxShadow: 'inset 0 0 0 var(--dsh-hairline-width, 1px) var(--dsh-button-outline-color, var(--dsw-alias-border-l3, rgba(255, 255, 255, 0.16)))',
+}
+
+// The active state of a segmented control: the app's hover fill, no border.
+const CONTROL_ACTIVE: any = {
+	background: 'var(--dsw-alias-interactive-bg-hover, #ffffff14)',
+	color: TEXT,
+}
+
+// The utility rows put two fixed-width buttons on the right. Fixing their widths
+// lets the profile start button span exactly the same block (76 + 8 + 68).
+const ACTION_EDIT_WIDTH = 76
+const ACTION_DELETE_WIDTH = 68
+const ACTION_GAP = 8
+const ACTION_SPAN = `${ACTION_EDIT_WIDTH + ACTION_GAP + ACTION_DELETE_WIDTH}px`
 const styles: Record<string, any> = {
 	// The page is a column: a fixed header and one scrolling region. Giving the
 	// scroll its own box keeps the scrollbar away from the chip switch instead of
@@ -270,39 +322,44 @@ const styles: Record<string, any> = {
 	title: { fontSize: '15px', fontWeight: 600, margin: 0 },
 	hint: { fontSize: '12px', color: TEXT_DIM, margin: 0 },
 	tabs: { display: 'flex', flexWrap: 'wrap', gap: '3px', margin: '0 0 8px' },
-	// Small, almost square segmented tabs: the pill shape was too loud next to
-	// the settings' own controls. The label is centred in a fixed-height box, so a
-	// smaller font reads as extra breathing room instead of cramped text.
-	tab: (active: boolean): any => ({
-		display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-		boxSizing: 'border-box', minHeight: '20px', padding: '0 9px',
-		borderRadius: '5px', cursor: 'pointer', fontSize: '10px', lineHeight: '14px',
-		border: `1px solid ${active ? BORDER : BORDER_SOFT}`,
-		background: active ? HOVER : 'transparent', color: active ? TEXT : TEXT_DIM,
-		font: 'inherit',
-	}),
+	// Every clickable control on the page shares one box (height, padding,
+	// radius, font size), so tabs, action buttons and switches line up.
+	tab: (active: boolean): any => ({ ...CONTROL, ...(active ? CONTROL_ACTIVE : { color: TEXT_DIM }) }),
 	// Rows keep the window's own background: no raised card surface, only a hairline.
 	card: {
 		border: `1px solid ${BORDER_SOFT}`, borderRadius: '8px', padding: '7px 10px',
 		marginBottom: '5px', background: 'transparent',
 	},
 	row: { display: 'flex', alignItems: 'center', gap: '8px' },
-	grow: { flex: 1, minWidth: 0 },
+	// The body an expanded server card grows by.
+	formBody: { paddingTop: '8px', marginTop: '8px', borderTop: `1px solid ${BORDER_SOFT}` },
+	grow: { flex: '1 1 auto', minWidth: 0 },
 	dot: (status: string): any => ({
 		width: '7px', height: '7px', borderRadius: '50%', flex: 'none',
 		background: STATUS_COLOR[status] ?? '#8a8a8a',
 	}),
 	name: { fontWeight: 600, fontSize: '12.5px', color: TEXT },
+	// Marks a server mirrored from the DSH MCP settings.
+	badge: {
+		marginLeft: '6px', fontSize: '10px', fontWeight: 400, color: TEXT_DIM,
+		border: `1px solid ${BORDER_SOFT}`, borderRadius: '4px', padding: '0 4px',
+	},
 	// Long hints must wrap instead of being cut with an ellipsis.
 	meta: { fontSize: '11px', color: TEXT_DIM, overflowWrap: 'anywhere' },
-	button: {
-		font: 'inherit', fontSize: '11px', padding: '3px 8px', borderRadius: '6px', cursor: 'pointer',
-		border: `1px solid ${BORDER}`, background: 'transparent', color: TEXT,
+	// The "managed in Settings" note sits under the profile action button.
+	profileHint: { fontSize: '11px', fontWeight: 600, color: TEXT_DIM, textAlign: 'center', marginTop: '4px', overflowWrap: 'anywhere' },
+	button: { ...CONTROL },
+	// Fixed-width row actions: the pair and the wide single button share one span.
+	actionEdit: { ...CONTROL, width: `${ACTION_EDIT_WIDTH}px`, padding: '0 6px' },
+	actionDelete: { ...CONTROL, width: `${ACTION_DELETE_WIDTH}px`, padding: '0 6px' },
+	// Same box, but the long label wraps to two lines instead of being clipped.
+	wideAction: {
+		...CONTROL, width: ACTION_SPAN, height: 'auto', minHeight: '28px',
+		padding: '4px 6px', whiteSpace: 'normal', lineHeight: '14px', textAlign: 'center',
 	},
-	primary: {
-		font: 'inherit', fontSize: '11px', padding: '4px 10px', borderRadius: '6px', cursor: 'pointer',
-		border: '1px solid transparent', background: ACCENT, color: ON_ACCENT, fontWeight: 500,
-	},
+	actionColumn: { display: 'flex', flexDirection: 'column', gap: '4px', flex: 'none', alignItems: 'stretch', width: ACTION_SPAN },
+	// Filled variants keep the same box; only the fill and label colour differ.
+	filled: { ...CONTROL, background: 'var(--dsw-alias-button-ghost-active-hover, rgba(127, 127, 127, 0.32))' },
 	field: { display: 'block', marginBottom: '6px', fontSize: '12px' },
 	label: { display: 'block', fontSize: '11px', color: TEXT_DIM, marginBottom: '2px' },
 	input: {
@@ -326,11 +383,8 @@ const styles: Record<string, any> = {
 		lineHeight: '18px',
 	},
 	// Three-state control (on / off / inherit) used by the preset rows.
-	segment: (active: boolean): any => ({
-		font: 'inherit', fontSize: '10.5px', padding: '1px 7px', cursor: 'pointer',
-		border: `1px solid ${active ? BORDER : BORDER_SOFT}`, borderRadius: '6px',
-		background: active ? HOVER : 'transparent', color: active ? TEXT : TEXT_DIM,
-	}),
+	segments: { display: 'flex', gap: '4px', flexWrap: 'wrap', flex: 'none' },
+	segment: (active: boolean): any => ({ ...CONTROL, ...(active ? CONTROL_ACTIVE : { color: TEXT_DIM }) }),
 	// The composer sits at the bottom of the window: a card anchored to its top
 	// edge would fall off-screen. Measure the viewport and flip upwards instead.
 	popover: (rect: DOMRect | null): any => {
@@ -480,6 +534,9 @@ function ServerForm(props: any): any {
 	const t = props.t
 	const [draft, setDraft] = useState<Draft>(props.initial)
 	const busy: boolean = props.busy === true
+	// An existing server is edited in place, inside its own card: the card grows
+	// instead of pushing a detached form to the top of the page.
+	const embedded: boolean = props.embedded === true
 
 	const field = (key: keyof Draft, labelKey: string, placeholder?: string, multiline = false): any =>
 		h('label', { style: styles.field, key: key },
@@ -493,11 +550,13 @@ function ServerForm(props: any): any {
 			}),
 		)
 
-	return h('div', { style: { ...styles.card, padding: '10px', marginBottom: '8px' } },
-		h('div', { style: styles.row },
-			h('div', { style: { ...styles.name, ...styles.grow } }, draft.editing ? t('servers.edit') : t('servers.add')),
-			h('button', { style: styles.button, onClick: props.onClose }, '×'),
-		),
+	return h('div', { style: embedded ? styles.formBody : { ...styles.card, padding: '10px', marginBottom: '8px' } },
+		embedded
+			? null
+			: h('div', { style: styles.row },
+				h('div', { style: { ...styles.name, ...styles.grow } }, draft.editing ? t('servers.edit') : t('servers.add')),
+				h('button', { style: styles.button, onClick: props.onClose }, '×'),
+			),
 		field('name', 'servers.name', 'my-server'),
 		field('description', 'servers.description', t('servers.descriptionHint')),
 		h('label', { style: styles.field },
@@ -536,7 +595,8 @@ function ServerForm(props: any): any {
 		field('startupTimeoutMs', 'servers.startupTimeoutMs', '30000'),
 		h('div', { style: { ...styles.row, marginTop: '10px' } },
 			h('button', {
-				style: styles.primary,
+				style: styles.filled,
+				'data-fill': '',
 				disabled: busy || draft.name.trim() === '',
 				onClick: () => props.onSave(draft),
 			}, t('servers.save')),
@@ -553,8 +613,14 @@ function ServersTab(props: any): any {
 	const t = props.t
 	const doc: StateDoc = props.doc
 	const { reload, busy, run } = props
-	const [editing, setEditing] = useState<Draft | undefined>(undefined)
+	const [open, setOpen] = useState<string | undefined>(undefined)
+	const [adding, setAdding] = useState(false)
 	const servers: ServerView[] = doc.servers
+
+	const close = (): void => {
+		setOpen(undefined)
+		setAdding(false)
+	}
 
 	const save = (draft: Draft): void => {
 		run(async () => {
@@ -572,7 +638,7 @@ function ServersTab(props: any): any {
 				toolCallTimeoutMs: numberOf(draft.toolCallTimeoutMs),
 				startupTimeoutMs: numberOf(draft.startupTimeoutMs),
 			})
-			setEditing(undefined)
+			close()
 			reload()
 		})
 	}
@@ -580,49 +646,117 @@ function ServersTab(props: any): any {
 	const remove = (name: string): void => {
 		run(async () => {
 			await request('/server/delete', { name })
-			setEditing(undefined)
+			close()
+			reload()
+		})
+	}
+
+	const activate = (name: string, action: 'load' | 'release'): void => {
+		run(async () => {
+			await request('/activate', { sessionId: doc.sessionId ?? '', server: name, action, cwd: doc.cwd })
 			reload()
 		})
 	}
 
 	const list = servers.length === 0
 		? h('p', { style: styles.empty, key: 'empty' }, t('servers.empty'))
-		: servers.map(server => h('div', { style: styles.card, key: server.name },
-			h('div', { style: styles.row },
-				dot(server.status),
-				h('div', { style: styles.grow },
-					h('div', { style: styles.name }, server.name),
-					h('div', { style: styles.meta }, serverSummary(server)),
-					h('div', { style: styles.meta },
-						`${statusLabel(server.status, t)}${server.live ? ` · ${t('servers.live')} ${server.toolCount}` : ''}`
-						+ ` · ${t(server.loadMode === 'eager' ? 'loadMode.eager' : 'loadMode.lazy')}`,
+		: servers.map(server => {
+			const expanded = open === server.name
+			// A server the settings keep switched off can be started here for as
+			// long as the agent needs it; a server we started can be stopped again.
+			// The hint sits under the button, in the same block as Edit + Delete.
+			const actions = server.origin === 'profile'
+				? h('div', { key: 'actions', style: styles.actionColumn },
+					server.owned
+						? h('button', {
+							key: 'stop',
+							style: styles.wideAction,
+							disabled: busy || !server.live,
+							onClick: () => activate(server.name, 'release'),
+						}, t('servers.stopProfile'))
+						: server.profileEnabled === false
+							? h('button', {
+								key: 'start',
+								style: styles.wideAction,
+								disabled: busy,
+								onClick: () => activate(server.name, 'load'),
+							}, t('servers.startProfile'))
+							: null,
+				)
+				: [
+					h('button', {
+						key: 'edit',
+						style: styles.actionEdit,
+						disabled: busy,
+						onClick: () => {
+							setAdding(false)
+							setOpen(expanded ? undefined : server.name)
+						},
+					}, expanded ? t('servers.cancel') : t('servers.edit')),
+					h('button', { key: 'delete', style: styles.actionDelete, onClick: () => remove(server.name) }, t('servers.delete')),
+				]
+			return h('div', { style: styles.card, key: server.name },
+				h('div', { style: styles.row },
+					dot(server.status),
+					h('div', { style: styles.grow },
+						h('div', { style: styles.name },
+							server.name,
+							server.origin === 'profile'
+								? h('span', { style: styles.badge }, t('servers.profile'))
+								: null,
+						),
+						h('div', { style: styles.meta }, serverSummary(server)),
+						h('div', { style: styles.meta },
+							`${statusLabel(server.status, t)}${server.live && server.origin !== 'profile' ? ` · ${t('servers.live')} ${server.toolCount}` : server.origin !== 'profile' && server.toolCount > 0 ? ` · ${t('servers.cached')} ${server.toolCount}` : ''}`
+							+ (server.origin === 'profile' ? '' : ` · ${t(server.loadMode === 'eager' ? 'loadMode.eager' : 'loadMode.lazy')}`),
+						),
 					),
+					actions,
 				),
-				h('button', { style: styles.button, onClick: () => setEditing(draftOf(server)) }, t('servers.edit')),
-				h('button', { style: styles.button, onClick: () => remove(server.name) }, t('servers.delete')),
-			),
-		))
-
-	const form = editing === undefined
-		? null
-		: h(ServerForm, {
-			key: 'form',
-			t,
-			initial: editing,
-			busy,
-			onSave: save,
-			onClose: () => setEditing(undefined),
+				// The note about the DSH settings lines up with the button above.
+				server.origin === 'profile'
+					? h('div', { key: 'profile', style: styles.profileHint }, t('servers.profileHint'))
+					: null,
+				// The card itself grows: the form belongs to this server.
+				expanded
+					? h(ServerForm, {
+						key: 'form',
+						embedded: true,
+						t,
+						initial: draftOf(server),
+						busy,
+						onSave: save,
+						onClose: close,
+					})
+					: null,
+			)
 		})
 
 	return h('div', null,
 		h('p', { style: styles.hint }, t('servers.hint')),
 		h('div', { style: { ...styles.row, margin: '6px 0' } },
 			h('div', { style: { ...styles.name, ...styles.grow } }, t('servers.title')),
-			editing === undefined
-				? h('button', { style: styles.primary, onClick: () => setEditing({ ...EMPTY_DRAFT }) }, t('servers.add'))
-				: null,
+			adding
+				? null
+				: h('button', {
+					style: styles.filled,
+					'data-fill': '',
+					onClick: () => {
+						setOpen(undefined)
+						setAdding(true)
+					},
+				}, t('servers.add')),
 		),
-		form,
+		adding
+			? h(ServerForm, {
+				key: 'add',
+				t,
+				initial: { ...EMPTY_DRAFT },
+				busy,
+				onSave: save,
+				onClose: close,
+			})
+			: null,
 		list,
 	)
 }
@@ -738,7 +872,8 @@ function PresetsTab(props: any): any {
 				onChange: (event: any) => setName(event.target.value),
 			}),
 			h('button', {
-				style: styles.primary,
+				style: styles.filled,
+				'data-fill': '',
 				disabled: busy || name.trim() === '',
 				onClick: create,
 			}, t('presets.create')),
@@ -819,6 +954,7 @@ function SettingsPage(props: any): any {
 	const [busy, setBusy] = useState(false)
 	const [error, setError] = useState<string | undefined>(undefined)
 	const [showChip, setShowChip] = useState<boolean | undefined>(undefined)
+	const [lifecycle, setLifecycle] = useState<Lifecycle | undefined>(undefined)
 	const { sessionId, cwd } = usePanelSession(props)
 	const { doc, error: loadError, reload } = useStateDoc(sessionId, 0, cwd)
 
@@ -831,11 +967,20 @@ function SettingsPage(props: any): any {
 	}, [])
 
 	const chip = showChip ?? doc?.settings.showChip ?? true
+	const mode = lifecycle ?? doc?.settings.profileLifecycle ?? 'auto'
 
 	const toggleChip = (next: boolean): void => {
 		setShowChip(next)
 		run(async () => {
 			await request('/settings', { showChip: next })
+			reload()
+		})
+	}
+
+	const changeLifecycle = (next: Lifecycle): void => {
+		setLifecycle(next)
+		run(async () => {
+			await request('/settings', { profileLifecycle: next })
 			reload()
 		})
 	}
@@ -848,10 +993,18 @@ function SettingsPage(props: any): any {
 				? h(PresetsTab, { t, doc, reload, busy, run })
 				: h(FoldersTab, { t, doc, reload, busy, run })
 
+	const lifecycleButton = (id: Lifecycle, label: string): any =>
+		h('button', {
+			key: id,
+			style: styles.segment(mode === id),
+			disabled: busy,
+			onClick: () => changeLifecycle(id),
+		}, label)
+
 	const tabButton = (id: 'servers' | 'presets' | 'folders', label: string): any =>
 		h('button', { key: id, style: styles.tab(tab === id), onClick: () => setTab(id) }, label)
 
-	return h('div', { style: styles.page },
+	return h('div', { style: styles.page, 'data-mcptool': '' },
 		h('div', { style: styles.header },
 			h('p', { style: styles.hint }, t('panel.subtitle')),
 			h('div', { style: { ...styles.row, margin: '8px 0' } },
@@ -860,6 +1013,19 @@ function SettingsPage(props: any): any {
 					h('div', { style: styles.meta }, t('settings.showChipHint')),
 				),
 				toggleSwitch(chip, toggleChip, 'show-chip', busy),
+			),
+			h('div', { style: { margin: '0 0 8px' } },
+				h('div', { style: { ...styles.row, flexWrap: 'wrap', alignItems: 'center' } },
+					h('div', { style: styles.grow },
+						h('div', { style: styles.name }, t('settings.profileLifecycle')),
+					),
+					h('div', { style: styles.segments },
+						lifecycleButton('auto', t('profileLifecycle.auto')),
+						lifecycleButton('flip', t('profileLifecycle.flip')),
+						lifecycleButton('mount', t('profileLifecycle.mount')),
+					),
+				),
+				h('div', { style: { ...styles.meta, marginTop: '4px' } }, t('profileLifecycle.hint.' + mode)),
 			),
 			h('div', { style: { ...styles.tabs, margin: 0 } },
 				tabButton('servers', t('tabs.servers')),
@@ -910,7 +1076,7 @@ function ChipPopup(props: any): any {
 	))
 
 	return ReactDOM.createPortal(
-		h('div', { style: styles.popover(rect) },
+		h('div', { style: styles.popover(rect), 'data-mcptool': '' },
 			h('div', { style: { ...styles.row, marginBottom: '6px' } },
 				h('div', { style: { ...styles.name, ...styles.grow } }, t('chip.title')),
 				h('button', { style: styles.button, onClick: props.onClose }, '×'),
@@ -956,10 +1122,11 @@ function Chip(props: any): any {
 		setOpen(!open)
 	}
 
-	return h('div', { style: { position: 'relative', display: 'inline-flex' } },
+	return h('div', { style: { position: 'relative', display: 'inline-flex' }, 'data-mcptool': '' },
 		h('button', {
 			ref: button,
 			style: styles.chip,
+			'data-chip': '',
 			title: t('chip.hint'),
 			onClick: toggle,
 		},
@@ -983,6 +1150,13 @@ const EN: Record<string, string> = {
 	'loading': 'Loading…',
 	'settings.showChip': 'Show the chip in the chat',
 	'settings.showChipHint': 'A small preset switch next to the composer, so a folder preset can be changed without opening settings.',
+	'settings.profileLifecycle': 'Servers from the DSH MCP settings',
+	'profileLifecycle.hint.auto': 'Picks per server: mount what the settings keep enabled, flip what they keep disabled.',
+	'profileLifecycle.hint.flip': 'Toggles the enabled switch of the DSH MCP settings; the manager starts and stops the process.',
+	'profileLifecycle.hint.mount': 'The plugin runs its own client in a private scope; the settings entry stays off while it is mounted.',
+	'profileLifecycle.auto': 'Auto',
+	'profileLifecycle.flip': 'Toggle',
+	'profileLifecycle.mount': 'Own process',
 	'tabs.servers': 'MCP',
 	'tabs.presets': 'Presets',
 	'tabs.folders': 'Working folders',
@@ -1009,6 +1183,7 @@ const EN: Record<string, string> = {
 	'servers.startupTimeoutMs': 'Startup timeout (ms, optional)',
 	'servers.empty': 'No server is registered yet.',
 	'servers.live': 'tools:',
+	'servers.cached': 'cached tools:',
 	'loadMode.lazy': 'Loads on demand',
 	'loadMode.eager': 'Always running',
 	'state.on': 'On',
@@ -1034,6 +1209,11 @@ const EN: Record<string, string> = {
 	'status.failed': 'failed',
 	'status.stopped': 'stopped',
 	'status.inactive': 'not started',
+	'status.external': 'started by DSH',
+	'servers.profile': 'from settings',
+	'servers.profileHint': 'managed in Settings → MCP',
+	'servers.startProfile': 'Start on demand',
+	'servers.stopProfile': 'Stop',
 }
 
 const RU: Record<string, string> = {
@@ -1043,6 +1223,13 @@ const RU: Record<string, string> = {
 	'loading': 'Загрузка…',
 	'settings.showChip': 'Показывать чип в диалоге',
 	'settings.showChipHint': 'Небольшой переключатель пресета рядом с полем ввода — папку можно переключить, не открывая настройки.',
+	'settings.profileLifecycle': 'Серверы из настроек DSH',
+	'profileLifecycle.hint.auto': 'Выбирает по серверу: включённые в настройках монтируются своим соединением, выключенные переключаются.',
+	'profileLifecycle.hint.flip': 'Переключает enabled в настройках DSH: процесс запускает и останавливает менеджер.',
+	'profileLifecycle.hint.mount': 'Плагин запускает собственный клиент в изолированном scope; запись в настройках остаётся выключенной.',
+	'profileLifecycle.auto': 'Авто',
+	'profileLifecycle.flip': 'Тумблер',
+	'profileLifecycle.mount': 'Свой процесс',
 	'tabs.servers': 'MCP',
 	'tabs.presets': 'Пресеты',
 	'tabs.folders': 'Рабочие папки',
@@ -1069,6 +1256,7 @@ const RU: Record<string, string> = {
 	'servers.startupTimeoutMs': 'Таймаут запуска (мс, необязательно)',
 	'servers.empty': 'Пока ни одного сервера.',
 	'servers.live': 'инструментов:',
+	'servers.cached': 'в кэше инструментов:',
 	'loadMode.lazy': 'Ленивая загрузка',
 	'loadMode.eager': 'Всегда запущен',
 	'state.on': 'Вкл',
@@ -1094,10 +1282,28 @@ const RU: Record<string, string> = {
 	'status.failed': 'ошибка',
 	'status.stopped': 'остановлен',
 	'status.inactive': 'не запущен',
+	'status.external': 'запущен DSH',
+	'servers.profile': 'из настроек',
+	'servers.profileHint': 'управляется в Настройках → MCP',
+	'servers.startProfile': 'Запустить по требованию',
+	'servers.stopProfile': 'Остановить',
+}
+
+/** Injects the small rule set that inline styles cannot express. */
+function mountCss(): () => void {
+	// The bundle is also loaded by a DOM-less harness (node --test), so the
+	// stylesheet is optional rather than assumed.
+	if (typeof document === 'undefined') return () => {}
+	const style = document.createElement('style')
+	style.setAttribute('data-plugin-css', 'dsh-mcp-tool')
+	style.textContent = CSS
+	document.head.appendChild(style)
+	return () => { style.remove() }
 }
 
 /** Mounts the settings page and the composer chip. */
 export function apply(ctx: any): void {
+	ctx.effect(mountCss, 'mcp-tool: styles')
 	ctx.effect(() => ctx.locale.register(NS, 'en', EN), 'mcp-tool: en dictionary')
 	ctx.effect(() => ctx.locale.register(NS, 'ru', RU), 'mcp-tool: ru dictionary')
 	const t = ctx.locale.bind(NS)

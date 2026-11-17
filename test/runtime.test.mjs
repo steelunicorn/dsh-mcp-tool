@@ -198,3 +198,33 @@ test('dispose stops everything and restores visibility', async () => {
 	assert.equal(runtime.isLive('alpha'), false)
 	assert.equal(host.hides.has('agent-2'), false)
 })
+
+test('load stops the process when the caller aborts the start', async () => {
+	const host = makeHost()
+	const runtime = new McpRuntime({ manager: host.manager, catalog: host.catalog, startupTimeoutMs: 2000 })
+	host.setStatus('starting')
+	const controller = new AbortController()
+	const pending = runtime.load(spec('alpha'), 'agent-1', ['alpha'], controller.signal)
+	setTimeout(() => controller.abort(), 60)
+	await assert.rejects(pending, (error) => {
+		assert.ok(error instanceof ActivationError)
+		assert.equal(error.reason, 'aborted')
+		return true
+	})
+	assert.equal(runtime.isLive('alpha'), false)
+	assert.deepEqual(host.stopped, ['alpha'])
+})
+
+test('load stops the process when the holder is released while starting', async () => {
+	const host = makeHost()
+	const runtime = new McpRuntime({ manager: host.manager, catalog: host.catalog, startupTimeoutMs: 2000 })
+	host.setStatus('starting')
+	const pending = runtime.load(spec('alpha'), 'agent-1', ['alpha'])
+	setTimeout(() => runtime.release('alpha', 'agent-1'), 60)
+	await assert.rejects(pending, (error) => {
+		assert.ok(error instanceof ActivationError)
+		assert.equal(error.reason, 'aborted')
+		return true
+	})
+	assert.equal(runtime.isLive('alpha'), false)
+})

@@ -44,6 +44,21 @@ export interface GuiBackend {
 	release(sessionId: string, server: string): { released: boolean; stopped: boolean }
 	/** Called after a mutation so the host can reload eager servers. */
 	changed?(): void
+	/**
+	 * Mirrors the servers configured in the DSH MCP settings. Awaited before the
+	 * page state is built, so opening the settings page is enough to pick up a
+	 * server added — or dropped — in the profile.
+	 */
+	syncProfile?(): void | Promise<void>
+	/** Refreshes the cached tool lists of servers that are currently up. */
+	syncCatalog?(): void | Promise<void>
+	/**
+	 * Switches one entry of the DSH MCP settings on or off through the host's
+	 * config editor. Absent when the profile has no editable manager entry.
+	 */
+	setProfileEnabled?(server: string, enabled: boolean): Promise<void>
+	/** Whether this plugin started the mirrored server (and may stop it again). */
+	profileOwned?(server: string): boolean
 	/** Filesystem-backed existence check used by the folder picker. */
 	exists(path: string): Promise<boolean>
 }
@@ -166,6 +181,12 @@ function serverFromBody(body: Record<string, unknown>): ServerRecord {
 	return record
 }
 
+/** Refuses an edit of a server the DSH MCP settings own. */
+function refuseProfile(store: Store, name: string): void {
+	if (store.server(name)?.origin !== 'profile') return
+	throw new Error(`server "${name}" is configured in the DSH MCP settings; edit it there`)
+}
+
 /**
  * Registers the plugin routes.
  * @returns the disposer removing them.
@@ -202,6 +223,10 @@ export function registerRoutes(backend: GuiBackend, webServer: {
 				if (req.method === 'GET' && route === '/state') {
 					const sessionId = url.searchParams.get('sessionId') ?? undefined
 					const cwdHint = url.searchParams.get('cwd') ?? undefined
+					// Opening the page mirrors the DSH MCP settings, so a server
+					// added or removed in the profile shows up without a restart.
+					await backend.syncProfile?.()
+					await backend.syncCatalog?.()
 					json(res, 200, state(backend, store, sessionId, cwdHint))
 					return
 				}
@@ -215,6 +240,7 @@ export function registerRoutes(backend: GuiBackend, webServer: {
 				}
 				if (req.method === 'POST' && route === '/server') {
 					const record = serverFromBody(await readJson(req))
+					refuseProfile(store, record.name)
 					await store.putServer(record)
 					backend.changed?.()
 					json(res, 200, { ok: true })
@@ -222,7 +248,9 @@ export function registerRoutes(backend: GuiBackend, webServer: {
 				}
 				if (req.method === 'POST' && route === '/server/delete') {
 					const body = await readJson(req)
-					await store.deleteServer(requireString(body, 'name'))
+					const name = requireString(body, 'name')
+					refuseProfile(store, name)
+					await store.deleteServer(name)
 					backend.changed?.()
 					json(res, 200, { ok: true })
 					return
@@ -259,8 +287,20 @@ export function registerRoutes(backend: GuiBackend, webServer: {
 				}
 				if (req.method === 'POST' && route === '/settings') {
 					const body = await readJson(req)
-					if (typeof body.showChip !== 'boolean') throw new Error('"showChip" must be a boolean')
-					await store.setSettings({ showChip: body.showChip })
+					const current = store.settings()
+					const next = { ...current }
+					if (body.showChip !== undefined) {
+						if (typeof body.showChip !== 'boolean') throw new Error('"showChip" must be a boolean')
+						next.showChip = body.showChip
+					}
+					if (body.profileLifecycle !== undefined) {
+						const value = body.profileLifecycle
+						if (value !== 'auto' && value !== 'flip' && value !== 'mount') {
+							throw new Error('"profileLifecycle" must be "auto", "flip" or "mount"')
+						}
+						next.profileLifecycle = value
+					}
+					await store.setSettings(next)
 					backend.changed?.()
 					json(res, 200, { ok: true })
 					return
@@ -275,6 +315,19 @@ export function registerRoutes(backend: GuiBackend, webServer: {
 					}
 					const loaded = await backend.load(sessionId, server, optionalString(body, 'cwd'))
 					json(res, 200, { ok: true, server: loaded.name, tools: loaded.tools.map(tool => tool.name) })
+					return
+				}
+				if (req.method === 'POST' && (route === '/profile/enabled' || route === '/debug/profile-enabled')) {
+					const setter = backend.setProfileEnabled
+					if (setter === undefined) {
+						json(res, 404, { ok: false, error: `unknown route ${route}` })
+						return
+					}
+					const body = await readJson(req)
+					const server = requireString(body, 'server')
+					if (typeof body.enabled !== 'boolean') throw new Error('enabled must be a boolean')
+					await setter(server, body.enabled)
+					json(res, 200, { ok: true, server, enabled: body.enabled })
 					return
 				}
 				if (req.method === 'GET' && route === '/folder-exists') {
@@ -315,6 +368,7 @@ function state(
 			description: record.description ?? '',
 			transport: record.transport,
 			loadMode: record.loadMode ?? 'lazy',
+			origin: record.origin ?? 'manual',
 			command: record.command ?? '',
 			args: record.args ?? [],
 			env: record.env ?? {},
@@ -324,10 +378,18 @@ function state(
 			toolCallTimeoutMs: record.toolCallTimeoutMs ?? 0,
 			startupTimeoutMs: record.startupTimeoutMs ?? 0,
 			status: entry?.status ?? 'inactive',
-			live: entry !== undefined,
+			// A row exists for a profile server even while the DSH manager keeps it
+			// stopped, so liveness follows the status instead of the row.
+			live: entry !== undefined && (entry.status === 'ready' || entry.status === 'starting'),
 			holders: entry?.holders ?? [],
-			toolCount: entry?.toolCount ?? 0,
+			// Cached from the last scan, so a stopped server still shows its size.
+			toolCount: entry?.toolCount || store.catalog(record.name).length,
+			catalogAt: store.catalogAt(record.name) ?? 0,
 			allowed: resolution.servers.includes(record.name),
+			// Whether the settings keep the server switched off, and whether this
+			// plugin is the one that started it on demand.
+			profileEnabled: record.origin === 'profile' ? record.profileEnabled !== false : false,
+			owned: backend.profileOwned?.(record.name) === true,
 		}
 	})
 	return {

@@ -126,6 +126,15 @@ test('settings default to the chip being visible and persist a change', async ()
 	assert.equal(store.settings().showChip, false)
 })
 
+test('the lifecycle keeps the old names working after an upgrade', async () => {
+	const flip = await Store.open(fakeStorageDomain({ global: { profileLifecycle: 'manager' } }))
+	assert.equal(flip.settings().profileLifecycle, 'flip')
+	const mount = await Store.open(fakeStorageDomain({ global: { profileLifecycle: 'own' } }))
+	assert.equal(mount.settings().profileLifecycle, 'mount')
+	const fresh = await Store.open(fakeStorageDomain())
+	assert.equal(fresh.settings().profileLifecycle, 'auto')
+})
+
 test('resolve reads the default preset, named presets inherit, folders pick the nearest', async () => {
 	const store = await Store.open(fakeStorageDomain())
 	await store.putServer(stdio('alpha'))
@@ -147,4 +156,82 @@ test('resolve reads the default preset, named presets inherit, folders pick the 
 	// Assigning the default preset means "no assignment", so the parent assignment still wins.
 	assert.deepEqual(store.resolve('/work/deep/a').servers, ['beta'])
 	assert.equal(store.resolve('/work/deep/a').preset, 'work')
+})
+
+test('importProfile mirrors the DSH settings and switches new servers off', async () => {
+	const store = await Store.open(fakeStorageDomain())
+	const result = await store.importProfile([
+		{ name: 'p1', transport: 'stdio', command: 'C:/tools/p1.exe', args: ['--mcp'] },
+	])
+	assert.deepEqual(result.added, ['p1'])
+	assert.equal(store.server('p1')?.origin, 'profile')
+	assert.equal(store.server('p1')?.command, 'C:/tools/p1.exe')
+	// A new import is invisible until a preset switches it on.
+	assert.equal(store.defaultPreset().rows.p1, 'off')
+	assert.deepEqual(store.resolve('/work').servers, [])
+})
+
+test('importProfile keeps manual records, local edits and reappears without duplicates', async () => {
+	const store = await Store.open(fakeStorageDomain())
+	await store.putServer(stdio('manual'))
+	await store.importProfile([{ name: 'p1', transport: 'stdio', command: 'first.exe' }])
+	await store.putPreset({ name: 'default', rows: { p1: 'on' } })
+	await store.putServer({ ...store.server('p1'), description: 'local note' })
+
+	const second = await store.importProfile([{ name: 'p1', transport: 'stdio', command: 'second.exe' }])
+	assert.deepEqual(second.added, [])
+	assert.deepEqual(second.updated, ['p1'])
+	// The connection fields follow the settings; local annotations survive.
+	assert.equal(store.server('p1')?.command, 'second.exe')
+	assert.equal(store.server('p1')?.description, 'local note')
+	assert.equal(store.server('p1')?.origin, 'profile')
+	assert.equal(store.server('manual')?.origin, undefined)
+	// An existing preset choice is not reset by a later sync.
+	assert.equal(store.defaultPreset().rows.p1, 'on')
+})
+
+test('a server dropped from the settings is removed and forgotten in presets', async () => {
+	const store = await Store.open(fakeStorageDomain())
+	await store.putServer(stdio('manual'))
+	await store.importProfile([
+		{ name: 'p1', transport: 'stdio', command: 'p1.exe' },
+		{ name: 'p2', transport: 'http', url: 'http://127.0.0.1:1234/mcp' },
+	])
+	await store.putPreset({ name: 'work', rows: { p1: 'on', p2: 'off' } })
+
+	const result = await store.importProfile([{ name: 'p1', transport: 'stdio', command: 'p1.exe' }])
+	assert.deepEqual(result.removed, ['p2'])
+	assert.equal(store.server('p2'), undefined)
+	assert.equal(store.preset('work')?.rows.p2, undefined)
+	assert.equal(store.server('p1')?.origin, 'profile')
+	// A manual server is never touched by the mirror.
+	assert.equal(store.server('manual')?.command, 'node')
+})
+
+test('putCatalog caches the last scan and skips an unchanged list', async () => {
+	const store = await Store.open(fakeStorageDomain())
+	await store.putServer(stdio('alpha'))
+	assert.deepEqual(store.catalog('alpha'), [])
+	assert.equal(store.catalogAt('alpha'), undefined)
+	const tools = [{ name: 'echo', description: 'echo text' }, { name: 'ping' }]
+	assert.equal(await store.putCatalog('alpha', tools, 1000), true)
+	assert.deepEqual(store.catalog('alpha').map(tool => tool.name), ['echo', 'ping'])
+	assert.equal(store.catalogAt('alpha'), 1000)
+	assert.equal(await store.putCatalog('alpha', tools, 2000), false)
+	assert.equal(store.catalogAt('alpha'), 1000)
+})
+
+test('putCatalog ignores a server that is not registered', async () => {
+	const store = await Store.open(fakeStorageDomain())
+	assert.equal(await store.putCatalog('ghost', [{ name: 'echo' }]), false)
+	assert.equal(store.server('ghost'), undefined)
+})
+
+test('importProfile keeps the cached catalog of a mirrored server', async () => {
+	const store = await Store.open(fakeStorageDomain())
+	await store.importProfile([{ name: 'p1', transport: 'stdio', command: 'node' }])
+	await store.putCatalog('p1', [{ name: 'echo', description: 'echo' }], 500)
+	await store.importProfile([{ name: 'p1', transport: 'stdio', command: 'node --new' }])
+	assert.deepEqual(store.catalog('p1').map(tool => tool.name), ['echo'])
+	assert.equal(store.server('p1')?.command, 'node --new')
 })

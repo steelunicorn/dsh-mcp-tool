@@ -98,7 +98,7 @@ export class ActivationError extends Error {
 	constructor(
 		message: string,
 		readonly server: string,
-		readonly reason: 'unknown' | 'not-allowed' | 'failed' | 'timeout' | 'capacity',
+		readonly reason: 'unknown' | 'not-allowed' | 'failed' | 'timeout' | 'capacity' | 'aborted',
 	) {
 		super(message)
 		this.name = 'ActivationError'
@@ -121,6 +121,12 @@ export class McpRuntime {
 	private readonly live = new Map<string, LiveServer>()
 	private readonly agents = new Set<string>()
 	private readonly hides = new Map<string, () => void>()
+	/**
+	 * Servers the host starts itself (the DSH MCP settings). The pool never
+	 * starts or stops them; it only withholds their tools from agents whose
+	 * folder preset does not allow them.
+	 */
+	private readonly adopted = new Set<string>()
 	private readonly manager: ManagerPort
 	private readonly catalog: CatalogPort
 	private readonly idleMs: number
@@ -145,6 +151,27 @@ export class McpRuntime {
 	/** True when the server is pinned by the plugin (eager load mode). */
 	isEager(server: string): boolean {
 		return this.live.get(server)?.holders.has(EAGER_HOLDER) === true
+	}
+
+	/** True when the host (not this pool) owns the server's process. */
+	isAdopted(server: string): boolean {
+		return this.adopted.has(server)
+	}
+
+	/**
+	 * Declares which servers the host starts itself. Their tools follow the
+	 * folder preset exactly like an eager server's do, but the plugin never
+	 * touches the process.
+	 */
+	setAdopted(names: readonly string[]): void {
+		this.adopted.clear()
+		for (const name of names) this.adopted.add(name)
+		this.syncVisibility()
+	}
+
+	/** Tools the host currently registers for one server, without starting it. */
+	catalogTools(server: string): ToolInfo[] {
+		return this.catalog.toolSchemas(server)
 	}
 
 	/** Registers an agent whose tool visibility the pool has to maintain. */
@@ -175,8 +202,19 @@ export class McpRuntime {
 		return [...(this.live.get(server)?.holders ?? [])]
 	}
 
-	/** Starts the server for one holder and waits until the catalog sees it. */
-	async load(spec: ServerSpec, holder: string, allowed: readonly string[]): Promise<LoadResult> {
+	/**
+	 * Starts the server for one holder and waits until the catalog sees it.
+	 *
+	 * A caller that gives up (a cancelled tool call, a disposed agent) aborts
+	 * the wait: the holder is dropped and a process nobody wants any more is
+	 * stopped instead of being left running.
+	 */
+	async load(
+		spec: ServerSpec,
+		holder: string,
+		allowed: readonly string[],
+		signal?: AbortSignal,
+	): Promise<LoadResult> {
 		if (!allowed.includes(spec.name)) {
 			throw new ActivationError(
 				`server "${spec.name}" is not allowed in this folder`,
@@ -203,7 +241,15 @@ export class McpRuntime {
 		entry.holders.add(holder)
 		entry.lastUsed = this.now()
 		this.syncVisibility()
-		const ready = await this.waitReady(entry)
+		const ready = await this.waitReady(entry, signal)
+		if (signal?.aborted === true || !entry.holders.has(holder)) {
+			// The caller went away while the process was starting. Dropping the
+			// holder stops the process when nothing else holds it.
+			entry.holders.delete(holder)
+			if (entry.holders.size === 0 && entry.inFlight === 0) this.stop(spec.name)
+			else this.syncVisibility()
+			throw new ActivationError(`loading "${spec.name}" was cancelled`, spec.name, 'aborted')
+		}
 		if (!ready) {
 			const reason = entry.status === 'failed' ? 'failed' : 'timeout'
 			const detail = entry.error ?? 'timeout'
@@ -344,6 +390,7 @@ export class McpRuntime {
 		for (const name of [...this.live.keys()]) this.stop(name)
 		for (const restore of this.hides.values()) restore()
 		this.hides.clear()
+		this.adopted.clear()
 		this.agents.clear()
 	}
 
@@ -388,9 +435,10 @@ export class McpRuntime {
 		return true
 	}
 
-	private async waitReady(entry: LiveServer): Promise<boolean> {
+	private async waitReady(entry: LiveServer, signal?: AbortSignal): Promise<boolean> {
 		const deadline = this.now() + this.startupTimeoutMs
 		for (;;) {
+			if (signal?.aborted === true) return false
 			const status = this.manager.status(entry.spec.name)
 			entry.status = status
 			if (status === 'ready') return true
@@ -448,6 +496,12 @@ export class McpRuntime {
 			for (const [name, entry] of this.live) {
 				if (entry.holders.has(agent)) continue
 				if (entry.holders.has(EAGER_HOLDER) && this.visibleTo(agent, name)) continue
+				denied.push(...this.catalog.toolNames(name))
+			}
+			// Adopted servers run outside the pool: their tools are visible only
+			// where the folder preset allows them.
+			for (const name of this.adopted) {
+				if (this.visibleTo(agent, name)) continue
 				denied.push(...this.catalog.toolNames(name))
 			}
 			const previous = this.hides.get(agent)

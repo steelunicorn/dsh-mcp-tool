@@ -47,6 +47,35 @@ export interface McpServerView {
 export interface McpManagerLike {
 	register(name: string, entry: McpServerEntry): Disposer
 	list(): McpServerView[]
+	/**
+	 * The manager's own configuration, holding the entries the DSH MCP settings
+	 * page writes. The plugin mirrors them; it never writes them.
+	 */
+	config?: {
+		servers?: { get(): Record<string, McpServerEntry> }
+	}
+}
+
+/** One server the DSH MCP settings describe, with its configured name. */
+export interface ConfiguredServer {
+	name: string
+	entry: McpServerEntry & { enabled?: boolean }
+}
+
+/**
+ * Reads the servers configured through the DSH MCP settings.
+ *
+ * Returns `undefined` when the host does not expose the configuration (an older
+ * host or a test double), which the caller treats as "do not mirror".
+ */
+export function configuredServers(manager: McpManagerLike): ConfiguredServer[] | undefined {
+	const servers = manager.config?.servers
+	if (servers === undefined || typeof servers.get !== 'function') return undefined
+	const configured = servers.get()
+	if (configured === undefined || configured === null || typeof configured !== 'object') return []
+	return Object.entries(configured)
+		.filter(([name, entry]) => name !== '' && entry !== undefined && entry !== null)
+		.map(([name, entry]) => ({ name, entry }))
 }
 
 /** A tool definition as `ctx.tools.definitions()` returns it. */
@@ -62,11 +91,32 @@ export interface ToolRestrictionLike {
 	deny?: readonly string[]
 }
 
+/** A refusal returned by `ctx.tools.guard()`; the string is shown to the model. */
+export type ToolGuardLike = (execution: { readonly name: string; readonly agent?: { readonly id?: string } }) => string | undefined
+
 /** The slice of `ctx.tools` this plugin uses. */
 export interface ToolsLike {
 	definitions(scope?: unknown): readonly ToolDefinitionLike[]
 	register(definition: never | object, options?: { when?: (context: ActivationContext) => boolean | Promise<boolean> }): Disposer
 	restrict(filter: ToolRestrictionLike): Disposer
+	/** Refuses an execution before it runs; the returned text becomes the error. */
+	guard?(guard: ToolGuardLike): Disposer
+	/** Tool schemas visible in one scope: the scope tag of a private mount. */
+	schemas?(scope?: unknown, toolSet?: unknown): readonly ToolSchemaLike[]
+	/** One tool definition by name, resolved inside a scope. */
+	get?(name: string, scope?: unknown, toolSet?: unknown): ToolDefinitionLike | undefined
+}
+
+/** The schema part of a tool, as `ctx.tools.schemas()` reports it. */
+export interface ToolSchemaLike {
+	readonly name: string
+	readonly description?: string
+	readonly parameters?: unknown
+}
+
+/** `ctx.loader.import()`: the host's way to reach a module the composition owns. */
+export interface LoaderLike {
+	import(name: string): Promise<unknown>
 }
 
 /** What a `when` predicate receives. */
@@ -104,6 +154,18 @@ export interface WorkingDirectoryLike {
 export interface ToolExecutionLike {
 	readonly name: string
 	readonly agent?: AgentLike
+}
+
+/** One row of the profile composition, as the config editor exposes it. */
+export interface ConfigEntryLike {
+	readonly options: { readonly id?: string; readonly name?: string }
+	readonly fiber?: { readonly state?: number }
+}
+
+/** The slice of `configEditor` this plugin uses to change another entry's config. */
+export interface ConfigEditorLike {
+	entries(): readonly ConfigEntryLike[]
+	edit(entry: ConfigEntryLike, change: (raw: Record<string, unknown>) => Record<string, unknown>): Promise<void>
 }
 
 /** The Host context, reduced to the services this plugin injects. */
