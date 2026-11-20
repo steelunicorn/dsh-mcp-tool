@@ -1,0 +1,85 @@
+name: Release
+
+# Publishes the packaged plugin to the GitHub release of the pushed tag.
+#
+# Every release must carry two assets with the same bytes:
+#   dsh-mcp-tool-<version>.tgz   the ordinary name
+#   dsh-mcp-tool.tgz             a version-free name for
+#                                /releases/latest/download/dsh-mcp-tool.tgz
+# The plugin market entry points at the second one, so a release without it
+# turns the storefront card into a 404 on the next version.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish the assets for'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged tree
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Pack
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # `lib/` is committed, so this only archives the tree: no build step.
+          npm pack --ignore-scripts
+          test -f "dsh-mcp-tool-$version.tgz"
+          cp "dsh-mcp-tool-$version.tgz" dsh-mcp-tool.tgz
+          ls -l dsh-mcp-tool-*.tgz dsh-mcp-tool.tgz
+
+      - name: Verify the archive installs as a bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -tzf dsh-mcp-tool.tgz > files.txt
+          for expected in package/package.json package/cordis.patch.yml package/lib/index.js package/lib/client.js; do
+            grep -qx "$expected" files.txt || { echo "missing $expected"; exit 1; }
+          done
+          node -e "const p=require('./package.json'); if(!p.dsh?.bundle?.patch) { console.error('no dsh.bundle.patch'); process.exit(1) }"
+
+      - name: Upload the assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+        run: |
+          set -euo pipefail
+          assets=("dsh-mcp-tool-$VERSION.tgz" "dsh-mcp-tool.tgz")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            for asset in "${assets[@]}"; do
+              gh release upload "$TAG" "$asset" --clobber
+            done
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "$TAG" \
+              --notes "Release $TAG"
+          fi
+          gh release view "$TAG" --json assets --jq '.assets[].name'
