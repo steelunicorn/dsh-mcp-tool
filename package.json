@@ -1,6 +1,6 @@
 {
 	"name": "dsh-mcp-tool",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Per-workspace MCP server governance for DeepSeek Harness: a global server registry with lazy, agent-driven activation.",
 	"type": "module",
 	"main": "lib/index.js",
