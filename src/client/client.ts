@@ -885,25 +885,48 @@ function PresetsTab(props: any): any {
 // Settings: folder assignments
 // ---------------------------------------------------------------------------
 
+/**
+ * The same key the host stores folder assignments under: see canonicalPath() in
+ * src/policy.ts. The client cannot import that module (it is host-side), so the
+ * rule is repeated here: backslashes become forward slashes, no trailing slash,
+ * and Windows paths (a drive letter or a UNC share) are lower-cased, which is
+ * what the host does on win32. Both implementations must yield the same string.
+ */
+function canonicalKey(input: string): string {
+	const windows = /^[A-Za-z]:[\\/]/.test(input) || input.startsWith('\\\\')
+	let value = input.split('\\').join('/')
+	if (value.length > 1) while (value.endsWith('/')) value = value.slice(0, -1)
+	if (value === '' || value === '/') return value
+	return windows ? value.toLowerCase() : value
+}
+
+/** One row per folder: the workspace record wins, its preset comes by key. */
+function folderRows(doc: StateDoc): Array<{ path: string; title?: string; key: string }> {
+	const rows: Array<{ path: string; title?: string; key: string }> = []
+	const seen = new Set<string>()
+	for (const workspace of doc.workspaces) {
+		const key = canonicalKey(workspace.path)
+		if (seen.has(key)) continue
+		seen.add(key)
+		rows.push({ path: workspace.path, title: workspace.title, key })
+	}
+	for (const folder of doc.folders) {
+		const key = canonicalKey(folder.path)
+		if (seen.has(key)) continue
+		seen.add(key)
+		rows.push({ path: folder.path, key })
+	}
+	rows.sort((left, right) => left.path.localeCompare(right.path))
+	return rows
+}
+
 function FoldersTab(props: any): any {
 	const t = props.t
 	const doc: StateDoc = props.doc
 	const { reload, busy, run } = props
 
-	const assigned = new Map<string, string>(doc.folders.map(folder => [folder.path, folder.preset]))
-	const rows: Array<{ path: string; title?: string }> = []
-	const seen = new Set<string>()
-	for (const workspace of doc.workspaces) {
-		if (seen.has(workspace.path)) continue
-		seen.add(workspace.path)
-		rows.push(workspace)
-	}
-	for (const folder of doc.folders) {
-		if (seen.has(folder.path)) continue
-		seen.add(folder.path)
-		rows.push({ path: folder.path })
-	}
-	rows.sort((left, right) => left.path.localeCompare(right.path))
+	const assigned = new Map<string, string>(doc.folders.map(folder => [canonicalKey(folder.path), folder.preset]))
+	const rows = folderRows(doc)
 
 	const assign = (target: string, next: string): void => {
 		run(async () => {
@@ -912,11 +935,11 @@ function FoldersTab(props: any): any {
 			reload()
 		})
 	}
-	const select = (target: string): any => h('select', {
+	const select = (row: { path: string; key: string }): any => h('select', {
 		style: { ...styles.input, width: 'auto' },
-		value: assigned.get(target) ?? DEFAULT_PRESET,
+		value: assigned.get(row.key) ?? DEFAULT_PRESET,
 		disabled: busy,
-		onChange: (event: any) => assign(target, event.target.value),
+		onChange: (event: any) => assign(row.path, event.target.value),
 	},
 		h('option', { value: DEFAULT_PRESET }, t('folders.defaultOption')),
 		doc.presets.filter(entry => entry.name !== DEFAULT_PRESET)
@@ -925,16 +948,16 @@ function FoldersTab(props: any): any {
 
 	const list = rows.length === 0
 		? h('p', { style: styles.empty }, t('folders.empty'))
-		: rows.map(row => h('div', { style: styles.card, key: row.path },
+		: rows.map(row => h('div', { style: styles.card, key: row.key },
 			h('div', { style: styles.row },
 				h('div', { style: styles.grow },
 					h('div', { style: styles.name }, row.title === undefined || row.title === '' ? row.path : row.title),
 					h('div', { style: styles.meta }, row.path),
-					doc.cwd !== '' && doc.cwd.toLowerCase() === row.path.toLowerCase()
+					doc.cwd !== '' && canonicalKey(doc.cwd) === row.key
 						? h('div', { style: styles.meta }, t('folders.active'))
 						: null,
 				),
-				select(row.path),
+				select(row),
 			),
 		))
 
