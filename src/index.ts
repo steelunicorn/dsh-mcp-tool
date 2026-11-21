@@ -19,6 +19,7 @@ import {
 	workingDirectoryOf,
 	type AgentLike,
 	type ConfigEditorLike,
+	type ConnectionLike,
 	type Disposer,
 	type HostContext,
 	type LoaderLike,
@@ -391,6 +392,17 @@ export function apply(ctx: PluginContext): void {
 		}
 	}
 
+	/** The host's connection service, the authority behind the route fence. */
+	const connectionOf = (): ConnectionLike | undefined => {
+		try {
+			const host = ctx as unknown as { get?: (name: string) => unknown }
+			return (typeof host.get === 'function' ? host.get('connection') : undefined) as ConnectionLike | undefined
+		} catch (error) {
+			debug(`connection service is not available: ${String(error)}`)
+			return undefined
+		}
+	}
+
 	/**
 	 * Flips `enabled` on one server of the DSH MCP settings.
 	 *
@@ -612,6 +624,7 @@ export function apply(ctx: PluginContext): void {
 	const backend: GuiBackend = {
 		store: () => store,
 		storeError: () => storeError,
+		requestRejection: (req: { headers: Record<string, string | string[] | undefined> }) => connectionOf()?.requestRejection?.(req),
 		live: () => {
 			const rows = runtime.snapshot()
 			const opened = store

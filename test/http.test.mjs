@@ -58,6 +58,7 @@ function harness(overrides = {}) {
 		},
 		exists: async path => path === '/work',
 		profileOwned: server => server === 'owned',
+		...(overrides.requestRejection === undefined ? {} : { requestRejection: overrides.requestRejection }),
 		...(overrides.setProfileEnabled === undefined ? {} : { setProfileEnabled: overrides.setProfileEnabled }),
 	}
 	registerRoutes(backend, {
@@ -392,4 +393,36 @@ test('a mutation with a non-JSON content type is refused', async () => {
 	const { route } = harness()
 	const { status } = await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { showChip: true }, { 'content-type': 'text/plain', 'x-dsh-mcp-tool': '1' })
 	assert.equal(status, 403)
+})
+
+test('the host fence answers before anything else, for reads as well', async () => {
+	const seen = []
+	const { route, calls } = harness({
+		requestRejection: req => {
+			seen.push(req.headers['x-forwarded-host'])
+			return 401
+		},
+	})
+	const read = await call(route, 'GET', `${ROUTE_PREFIX}/state`, undefined, { 'x-forwarded-host': 'evil.example' })
+	assert.equal(read.status, 401)
+	assert.deepEqual(read.json, { ok: false, error: 'unauthorized: browser authentication required', code: 'UNAUTHORIZED' })
+	// The fence runs before the store is touched, so nothing was mirrored or built.
+	assert.equal(calls.syncProfile, undefined)
+	assert.deepEqual(seen, ['evil.example'])
+	const write = await call(route, 'POST', `${ROUTE_PREFIX}/settings`, { showChip: false })
+	assert.equal(write.status, 401)
+	assert.deepEqual(calls.setSettings, [])
+})
+
+test('the host fence answers 403 with its own code', async () => {
+	const { route } = harness({ requestRejection: () => 403 })
+	const { status, json } = await call(route, 'GET', `${ROUTE_PREFIX}/workspaces`)
+	assert.equal(status, 403)
+	assert.deepEqual(json, { ok: false, error: 'forbidden: untrusted request', code: 'FORBIDDEN' })
+})
+
+test('without a host fence the routes behave as before', async () => {
+	const { route } = harness()
+	const { status } = await call(route, 'GET', `${ROUTE_PREFIX}/workspaces`)
+	assert.equal(status, 200)
 })

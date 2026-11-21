@@ -130,7 +130,9 @@ function fakeHost(options = {}) {
 			}
 		},
 	}
-	ctx.get = name => (name === 'configEditor' ? ctx.configEditor : ctx.workspaceRegistry)
+	ctx.get = name => (name === 'configEditor'
+		? ctx.configEditor
+		: name === 'connection' ? options.connection : ctx.workspaceRegistry)
 	return { ctx, agents, servers, defs, tools, sections, routes, disposers, cwd, tables, registered, activeRestrictions, guards, configured }
 }
 
@@ -543,4 +545,17 @@ test('mount mode reports a missing loader instead of pretending to start', async
 	assert.match(loaded.json.error, /loader service/)
 	// The entry was not touched: nothing may be flipped on for a failed mount.
 	assert.equal(host.configured.p1.enabled, false)
+})
+
+test('the host connection fence guards the routes', async () => {
+	const host = fakeHost({ connection: { requestRejection: () => 403 } })
+	apply(host.ctx)
+	await tick()
+	// Every route goes through the fence, not just the mutating ones.
+	const state = await call(host.routes[0], 'GET', `${ROUTE_PREFIX}/state`)
+	assert.equal(state.status, 403)
+	assert.equal(state.json.code, 'FORBIDDEN')
+	const write = await call(host.routes[0], 'POST', `${ROUTE_PREFIX}/server`, { name: 'alpha', transport: 'stdio', command: 'node' })
+	assert.equal(write.status, 403)
+	assert.equal(host.tables.get('servers').has('alpha'), false)
 })

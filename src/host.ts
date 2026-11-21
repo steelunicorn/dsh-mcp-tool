@@ -168,6 +168,18 @@ export interface ConfigEditorLike {
 	edit(entry: ConfigEntryLike, change: (raw: Record<string, unknown>) => Record<string, unknown>): Promise<void>
 }
 
+/**
+ * The host's connection service.
+ *
+ * `requestRejection` is the authority behind the web server's cookie gate:
+ * `401` when the browser has no valid token, `403` when the host or origin is
+ * not trusted, `undefined` when the request may proceed. Plugin routes are
+ * mounted on the web server directly, so they have to ask it themselves.
+ */
+export interface ConnectionLike {
+	requestRejection?(request: { headers: Record<string, string | string[] | undefined> }): 401 | 403 | undefined
+}
+
 /** The Host context, reduced to the services this plugin injects. */
 export interface HostContext {
 	mcpManager: McpManagerLike

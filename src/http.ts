@@ -22,8 +22,22 @@ export interface WorkspaceInfo {
 	title?: string
 }
 
+/** What the host's connection service needs to judge a request. */
+export interface RequestLike {
+	headers: Record<string, string | string[] | undefined>
+}
+
 /** The server-side operations behind the GUI. */
 export interface GuiBackend {
+	/**
+	 * The host's request fence for this request: `401` or `403` when the request
+	 * did not come from a DSH page, `undefined` when it may proceed.
+	 *
+	 * Plugin routes are registered on the web server directly and bypass its
+	 * cookie gate, so without this check any web page open in the same browser
+	 * could reach the routes — including the mutations.
+	 */
+	requestRejection?(req: RequestLike): 401 | 403 | undefined
 	/** The opened store, or undefined while initialization is still running. */
 	store(): Store | undefined
 	/** Why the store is still missing, when initialization failed. */
@@ -203,6 +217,20 @@ export function registerRoutes(backend: GuiBackend, webServer: {
 		path: ROUTE_PREFIX,
 		async handler(req, res) {
 			try {
+				// The host's own fence comes first: it rejects requests that did not
+				// originate from the DSH page (host/origin/browser token). Our CSRF
+				// header below stays as a second layer.
+				const rejection = backend.requestRejection?.(req)
+				if (rejection !== undefined) {
+					json(res, rejection, {
+						ok: false,
+						error: rejection === 401
+							? 'unauthorized: browser authentication required'
+							: 'forbidden: untrusted request',
+						code: rejection === 401 ? 'UNAUTHORIZED' : 'FORBIDDEN',
+					})
+					return
+				}
 				const url = new URL(req.url ?? '/', 'http://dsh')
 				const route = url.pathname.slice(ROUTE_PREFIX.length) || '/'
 				if (req.method !== 'GET' && !authorized(req)) {
